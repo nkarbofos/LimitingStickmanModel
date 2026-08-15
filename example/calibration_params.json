@@ -1,0 +1,28 @@
+{
+  "metadata": {
+    "video_path": "example.mp4",
+    "frame_index": 5
+  },
+  "head": {
+    "S": 117.80967404066939,
+    "k_hw": 0.5796008676914545,
+    "k_hh": 0.8365183762407201,
+    "width_coef": 0.5796008676914545,
+    "up_coef": 0.5517373724127373,
+    "down_coef": 0.28478100382798277
+  },
+  "torso": {
+    "S_ref": 117.80967404066939,
+    "ext_left_coef": 1.1713808829685808,
+    "ext_right_coef": 1.1628926157006922,
+    "dx_left_coef": -0.8433750437779242,
+    "dy_left_coef": 2.04555766838138,
+    "dx_right_coef": 0.726954400781405,
+    "dy_right_coef": 2.04555766838138,
+    "has_hip_ref": true,
+    "dx_left_coef_hip": -0.8471160117059336,
+    "dy_left_coef_hip": 0.35912244711581687,
+    "dx_right_coef_hip": 0.7232134328533956,
+    "dy_right_coef_hip": 0.35912244711581687
+  }
+}
