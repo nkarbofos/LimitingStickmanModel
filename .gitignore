@@ -1,0 +1,28 @@
+# Веса моделей: скачиваются автоматически, в репозитории не хранятся
+models/
+*.task
+*.tflite
+*.pt
+*.onnx
+
+# Результаты работы скриптов
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Инструменты и IDE
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.DS_Store

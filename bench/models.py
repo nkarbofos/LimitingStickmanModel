@@ -1,9 +1,7 @@
 """Создание моделей MediaPipe и YOLO."""
 
-import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
-from ultralytics import YOLO
 
 from . import config
 
@@ -40,6 +38,14 @@ def create_face_landmarker():
     return vision.FaceLandmarker.create_from_options(opts)
 
 
-def create_yolo():
-    return YOLO(config.YOLO_MODEL_PATH)
+def create_yolo(model_path=None):
+    """YOLO-детектор. ultralytics импортируется лениво: он нужен только при
+    USE_YOLO_CROP и при калибровке, поэтому базовая установка его не требует."""
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise ImportError(
+            "Для YOLO нужен пакет ultralytics: pip install 'limiting-stickman-model[calib]'"
+        ) from exc
+    return YOLO(model_path or config.YOLO_MODEL_PATH)
 

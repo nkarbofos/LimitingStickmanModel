@@ -1,5 +1,6 @@
 """Основной цикл бенчмарка."""
 
+import os
 import time
 import statistics
 import cv2
@@ -17,7 +18,8 @@ from .head_constraint import (compute_head_ellipse_from_pose,
 from .visualization import (category_mask_to_colored, confidence_masks_to_heatmap,
                             draw_pose_landmarks, draw_face_oval, compute_face_oval_size, 
                             fill_poly_with_alpha)
-from .stats import print_latency_stats, check_model
+from .stats import print_latency_stats
+from .download import ensure_models
 from .stickman_model import build_stickman_mask, overlay_stickman
 from .calibration import load_calibration_params
 from .tracking import build_head_rect_from_params, build_torso_quad_from_params, build_neck_quad_from_torso_and_head
@@ -38,25 +40,50 @@ def enhance_contrast_clahe(frame_bgr, clip_limit=2.0, grid_size=8):
     return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
 
 
-def main():
-    if config.ENABLE_SEGMENTATION and not check_model(
-            config.SEG_MODEL_PATH, "скачай selfie_multiclass_256x256.tflite"):
-        return
-    if config.ENABLE_POSE and not check_model(
-            config.POSE_MODEL_PATH, "скачай pose_landmarker_lite.task"):
-        return
-    if config.ENABLE_FACE and not check_model(
-            config.FACE_MODEL_PATH, "скачай face_landmarker.task"):
-        return
-    if config.USE_YOLO_CROP and not check_model(
-            config.YOLO_MODEL_PATH, "скачай yolo26n.pt (или yolo11n.pt)"):
-        return
-    if not (config.ENABLE_SEGMENTATION or config.ENABLE_POSE or config.ENABLE_FACE):
+def main(video_path=None, output_path=None, calibration_params_path=None,
+         max_frames=None, show_preview=None, use_yolo_crop=None,
+         save_output_video=None, enable_segmentation=None, auto_download=True):
+    """Прогоняет пайплайн по видео и печатает статистику скорости.
+
+    Все аргументы необязательны: None означает "взять значение из bench.config".
+    """
+    video_path = video_path or config.VIDEO_PATH
+    output_path = output_path or config.OUTPUT_VIDEO_PATH
+    if calibration_params_path is None:
+        calibration_params_path = config.default_calibration_params_path()
+    if max_frames is None:
+        max_frames = config.MAX_FRAMES
+    if show_preview is None:
+        show_preview = config.SHOW_PREVIEW
+    if use_yolo_crop is None:
+        use_yolo_crop = config.USE_YOLO_CROP
+    if save_output_video is None:
+        save_output_video = config.SAVE_OUTPUT_VIDEO
+    if enable_segmentation is None:
+        enable_segmentation = config.ENABLE_SEGMENTATION
+
+    if not (enable_segmentation or config.ENABLE_POSE or config.ENABLE_FACE):
         print("Все MediaPipe-бенчмарки выключены.")
         return
 
-    yolo_model = create_yolo() if config.USE_YOLO_CROP else None
-    segmenter = create_segmenter() if config.ENABLE_SEGMENTATION else None
+    # Недостающие веса докачиваются автоматически в models/
+    required = []
+    if enable_segmentation:
+        required.append(config.SEG_MODEL_NAME)
+    if config.ENABLE_POSE:
+        required.append(config.POSE_MODEL_NAME)
+    if config.ENABLE_FACE:
+        required.append(config.FACE_MODEL_NAME)
+    if use_yolo_crop:
+        required.append(config.YOLO_MODEL_NAME)
+    try:
+        ensure_models(required, auto_download=auto_download)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"[!] {exc}")
+        return
+
+    yolo_model = create_yolo() if use_yolo_crop else None
+    segmenter = create_segmenter() if enable_segmentation else None
     pose_landmarker = create_pose_landmarker() if config.ENABLE_POSE else None
     face_landmarker = create_face_landmarker() if config.ENABLE_FACE else None
 
@@ -66,7 +93,7 @@ def main():
     if pose_landmarker: loaded.append("PoseLandmarker-Lite")
     if face_landmarker: loaded.append("FaceLandmarker")
     print(f"Загружены модели: {', '.join(loaded)}")
-    print(f"USE_YOLO_CROP={config.USE_YOLO_CROP}, "
+    print(f"USE_YOLO_CROP={use_yolo_crop}, "
         f"HEAD_CONSTRAINT={config.ENABLE_HEAD_CONSTRAINT} "
         f"(u_coef={config.HEAD_ELLIPSE_RADIUS_U_COEF}, "
         f"n_coef={config.HEAD_ELLIPSE_RADIUS_N_COEF})\n")
@@ -75,19 +102,20 @@ def main():
     calib_params = None
     if config.ENABLE_STICKMAN_TRACKING:
         try:
-            calib_params = load_calibration_params(config.CALIBRATION_PARAMS_PATH)
+            calib_params = load_calibration_params(calibration_params_path)
         except FileNotFoundError:
-            print(f"[!] Файл калибровки не найден: {config.CALIBRATION_PARAMS_PATH}")
+            print(f"[!] Файл калибровки не найден: {calibration_params_path}")
             print("    Запустите calibrate_stickman.py для создания параметров.")
             calib_params = None
 
     n_mediapipe = sum(x is not None for x in (segmenter, pose_landmarker, face_landmarker))
-    n_active = n_mediapipe + (1 if config.USE_YOLO_CROP else 0)
+    n_active = n_mediapipe + (1 if use_yolo_crop else 0)
 
-    cap = cv2.VideoCapture(config.VIDEO_PATH)
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"Не удалось открыть видео: {config.VIDEO_PATH}")
+        print(f"Не удалось открыть видео: {video_path}")
         return
+    print(f"Видео-вход: {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -95,11 +123,12 @@ def main():
     print(f"Видео: {width}x{height}, {fps:.1f} FPS, {total_frames} кадров\n")
 
     out = None
-    if config.SAVE_OUTPUT_VIDEO:
+    if save_output_video:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(config.OUTPUT_VIDEO_PATH, fourcc, fps, (width, height))
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         if not out.isOpened():
-            print(f"[!] Не удалось создать видео-файл: {config.OUTPUT_VIDEO_PATH}")
+            print(f"[!] Не удалось создать видео-файл: {output_path}")
             out = None
 
     yolo_lat, seg_lat, pose_lat, face_lat, total_lat = [], [], [], [], []
@@ -110,7 +139,7 @@ def main():
     frame_processing_times = []
 
     print(f"{'Frame':>6} | {'YOLO':>6} | {'Seg':>6} | {'Pose':>6} | {'Face':>6} | "
-          f"{'Total':>7} | crop")
+          f"{'Models':>7} | {'Frame':>7} | crop")
     print("-" * 72)
 
     while True:
@@ -119,7 +148,7 @@ def main():
         ret, frame_bgr = cap.read()
         if not ret:
             break
-        if config.MAX_FRAMES is not None and frame_idx >= config.MAX_FRAMES:
+        if max_frames is not None and frame_idx >= max_frames:
             break
 
         # new
@@ -363,7 +392,7 @@ def main():
                 out.write(overlay)
 
             # --- ПРЕДПРОСМОТР (только если включён) ---
-            if config.SHOW_PREVIEW:
+            if show_preview:
                 cv2.imshow("MediaPipe benchmark (head constraint)", overlay)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     print("\nПрервано пользователем (q).")
@@ -375,11 +404,11 @@ def main():
     if segmenter: segmenter.close()
     if pose_landmarker: pose_landmarker.close()
     if face_landmarker: face_landmarker.close()
-    if config.SHOW_PREVIEW: cv2.destroyAllWindows()
+    if show_preview: cv2.destroyAllWindows()
 
     if out is not None:
         out.release()
-        print(f"\nВыходное видео сохранено: {config.OUTPUT_VIDEO_PATH}")
+        print(f"\nВыходное видео сохранено: {output_path}")
 
     print("\n" + "=" * 58)
     print("РЕЗУЛЬТАТЫ БЕНЧМАРКА")

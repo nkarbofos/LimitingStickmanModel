@@ -1,14 +1,30 @@
-"""Все настройки и константы бенчмарка."""
+"""Все настройки и константы бенчмарка.
+
+Пути собраны в bench/paths.py и считаются от корня репозитория, поэтому
+скрипты работают из любой рабочей директории. Значения ниже -- умолчания;
+почти все они переопределяются аргументами командной строки.
+"""
+
+import os
 
 import cv2
 
+from .paths import OUTPUT_DIR, example_path, model_path
+
+# --- Имена моделей (файлы лежат в models/, скачиваются bench/download.py) ---
+SEG_MODEL_NAME = "selfie_multiclass_256x256.tflite"
+POSE_MODEL_NAME = "pose_landmarker_lite.task"
+FACE_MODEL_NAME = "face_landmarker.task"
+YOLO_MODEL_NAME = "yolo26n.pt"
+YOLO_SEG_MODEL_NAME = "yolo26n-seg.pt"
+
 # --- Пути к моделям и видео ---
-SEG_MODEL_PATH = "selfie_multiclass_256x256.tflite"
-POSE_MODEL_PATH = "pose_landmarker_lite.task"
-FACE_MODEL_PATH = "face_landmarker.task"
-YOLO_MODEL_PATH = "yolo26n.pt"
-YOLO_SEG_MODEL_PATH = "yolo26n-seg.pt"
-VIDEO_PATH = "example.mp4"
+SEG_MODEL_PATH = str(model_path(SEG_MODEL_NAME))
+POSE_MODEL_PATH = str(model_path(POSE_MODEL_NAME))
+FACE_MODEL_PATH = str(model_path(FACE_MODEL_NAME))
+YOLO_MODEL_PATH = str(model_path(YOLO_MODEL_NAME))
+YOLO_SEG_MODEL_PATH = str(model_path(YOLO_SEG_MODEL_NAME))
+VIDEO_PATH = str(example_path("example.mp4"))
 
 SHOW_CURR_MASK = False
 
@@ -30,7 +46,7 @@ DRAW_HEAD_ELLIPSE = False           # рисовать верхний полуэ
 
 # --- Общие ---
 SAVE_OUTPUT_VIDEO = True
-OUTPUT_VIDEO_PATH = "output_selfie_multiclass_skeleton.mp4"
+OUTPUT_VIDEO_PATH = str(OUTPUT_DIR / "example_tracked.mp4")
 SHOW_PREVIEW = False   # окно можно держать выключенным
 WARMUP_FRAMES = 3
 DRAW_POSE = True
@@ -105,8 +121,41 @@ CALIBRATION_LEG_COEFS = {              # дефолтные коэффициен
 }
 
 # --- Отслеживание stickman-модели ---
-ENABLE_STICKMAN_TRACKING = True                      # применять модель при отслеживании
-CALIBRATION_PARAMS_PATH = "calibration_params.json"  # путь к параметрам калибровки
+ENABLE_STICKMAN_TRACKING = True    # применять модель при отслеживании
+
+# Куда calibrate_stickman.py кладёт результат калибровки
+CALIBRATION_PARAMS_OUTPUT_PATH = str(OUTPUT_DIR / "calibration_params.json")
+CALIBRATION_RESULT_IMAGE_PATH = str(OUTPUT_DIR / "calibration_result.png")
+# Готовая калибровка для example.mp4, идущая вместе с репозиторием
+CALIBRATION_PARAMS_EXAMPLE_PATH = str(example_path("calibration_params.json"))
+
+
+def default_calibration_params_path():
+    """Путь к параметрам калибровки, используемый при отслеживании.
+
+    Своя калибровка из output/ имеет приоритет; если её ещё нет, берётся
+    демо-калибровка из example/, чтобы track_stickman.py работал сразу
+    после клонирования.
+    """
+    if os.path.exists(CALIBRATION_PARAMS_OUTPUT_PATH):
+        return CALIBRATION_PARAMS_OUTPUT_PATH
+    return CALIBRATION_PARAMS_EXAMPLE_PATH
+
+
+CALIBRATION_PARAMS_PATH = CALIBRATION_PARAMS_OUTPUT_PATH  # обратная совместимость
+
+# --- Скрипт калибровки (calibrate_stickman.py) ---
+CALIB_YOLO_MODEL_NAME = "yolo26s.pt"          # детектор человека (точнее, чем n)
+CALIB_POSE_MODEL_NAME = "pose_landmarker_full.task"  # точный скелет
+CALIB_FACE_MODEL_NAME = "face_landmarker.task"       # подбородок
+CALIB_YOLO_MODEL_PATH = str(model_path(CALIB_YOLO_MODEL_NAME))
+CALIB_POSE_MODEL_PATH = str(model_path(CALIB_POSE_MODEL_NAME))
+CALIB_FACE_MODEL_PATH = str(model_path(CALIB_FACE_MODEL_NAME))
+
+CALIB_FRAME_INDEX = 5           # номер кадра для калибровки (1-based)
+CALIB_YOLO_BBOX_PADDING = 0.10  # запас вокруг box-а: 10% от размера
+CALIB_FACE_CHIN_INDEX = 152     # индекс подбородка (chin tip) в face_landmarker
+CALIB_MASK_OVERLAY_ALPHA = 0.5  # прозрачность маски InSPyReNet на визуализации
 DRAW_TRACKED_HEAD = True                             # рисовать отслеживаемую голову
 DRAW_TRACKED_TORSO = True                            # рисовать отслеживаемый торс
 DRAW_TRACKED_NECK = True                       # рисовать отслеживаемую шею
