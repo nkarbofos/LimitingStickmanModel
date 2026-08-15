@@ -17,6 +17,8 @@
 'calibration_result.png'
 Далее при вызове track_stickman.py наша stickman модель накладывается на фигуру человека на видео.
 
+'example_tracked.mp4'
+
 Видео сравнения чистого stickman model (Средний IoU: 0.8750, скорость: 28.8 FPS):
 
-'output_selfie_multiclass_skeleton.mp4'
+'output_stickman_accuracy.mp4'
