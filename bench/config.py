@@ -93,16 +93,22 @@ DRAW_STICKMAN = True                    # рисовать модель тела
 STICKMAN_HEAD_W_COEF = 0 #0.45             # k_hw: ширина головы = k_hw * S
 STICKMAN_HEAD_H_COEF = 0 #0.60             # k_hh: высота головы = k_hh * S
 STICKMAN_TORSO_SCALE = 0 #1.2              # масштаб торса относительно его центра (1.0 = без изменений)
-STICKMAN_PALM_COEF = 0.40               # k_palm: сторона квадрата ладони = k_palm * S
-STICKMAN_LIMB_COEFS = {                 # ширина каждой конечности = coef * S
+# Опускание точек бёдер перпендикулярно линии торса 23-24 (в долях S)
+STICKMAN_PALM_COEF = 0.2               # k_palm: сторона квадрата ладони = k_palm * S
+STICKMAN_FOOT_COEF = 0.5915               # k_foot: толщина ступни = k_foot * S_hip(таз)
+# Удлинение отрезка наружу от сустава: 1.0 = без удлинения, 1.3 = +30%
+STICKMAN_TORSO_EXTEND_COEF = 0 #0.4
+STICKMAN_PALM_EXTEND_COEF = 1.4         # отрезок ладони: 15 -> середина 19 и 17 (16 -> 20 и 18)
+STICKMAN_FOOT_EXTEND_COEF = 1.3         # отрезок ступни 27-31 / 28-32
+STICKMAN_LIMB_COEFS = {                 # руки: coef * S(плечи), ноги: coef * S_hip(таз)
     (11, 13): 0.36,   # левое плечо (верх руки)
     (13, 15): 0.33,   # левое предплечье
     (12, 14): 0.36,   # правое плечо (верх руки)
     (14, 16): 0.33,   # правое предплечье
-    (23, 25): 0.40,   # левое бедро
-    (25, 27): 0.36,   # левая голень
-    (24, 26): 0.40,   # правое бедро
-    (26, 28): 0.36,   # правая голень
+    (23, 25): 0.676,   # левое бедро
+    (25, 27): 0.6084,   # левая голень
+    (24, 26): 0.676,   # правое бедро
+    (26, 28): 0.6084,   # правая голень
 }
 STICKMAN_FALLBACK_TORSO_ANGLE = 75.0    # угол фолбэк-трапеции торса
 STICKMAN_FALLBACK_LENGTH_FACTOR = 3.0   # глубина фолбэк-трапеции
@@ -113,6 +119,20 @@ STICKMAN_ALPHA = 0.5                    # прозрачность заполн�
 CALIBRATION_W_EXTRA_THRESHOLD = 0.05   # порог W_extra: 5% от ширины плеч S
 CALIBRATION_EAR_EXTEND_COEF = 1.5      # макс. продление от ушей: 1.5 × |7-8|
 CALIBRATION_SHOULDER_EXTEND_COEF = 1.5
+CALIBRATION_HIP_EXTEND_COEF = 1.5      # макс. вытягивание отрезка бёдер (в долях S)
+# Линия живота: параллельна линии плеч, на доле расстояния плечи -> торс
+CALIBRATION_BELLY_COEF = 2.0 / 3.0     # доля перпендикулярного расстояния
+CALIBRATION_BELLY_EXTEND_COEF = 1.5    # макс. вытягивание до границы маски (в долях S)
+# --- Подбор нижней границы головы, когда подбородок не найден ---
+# Опускаем down_dist, максимизируя IoU фигуры (голова + шея) с маской
+# в фиксированной полосе между верхним ребром торса и уровнем носа.
+CALIBRATION_NECK_FIT_ENABLED = True     # включить подбор (иначе -- симметрично len_XN)
+CALIBRATION_NECK_FIT_MIN_COEF = 0.15    # нижняя граница перебора (в долях len_XN)
+CALIBRATION_NECK_FIT_MAX_COEF = 1.20    # верхняя граница перебора (в долях len_XN)
+CALIBRATION_NECK_FIT_STEP_PX = 1.0      # шаг перебора, px
+CALIBRATION_NECK_FIT_MARGIN_PX = 1.0    # запас над верхним ребром торса, px
+CALIBRATION_NECK_FIT_DEBUG = False      # печатать всю кривую IoU(d)
+
 CALIBRATION_LEG_COEFS = {              # дефолтные коэффициенты ног для вычитания
     (23, 25): 0.20,   # левое бедро
     (25, 27): 0.16,   # левая голень
@@ -156,10 +176,25 @@ CALIB_FRAME_INDEX = 5           # номер кадра для калибров�
 CALIB_YOLO_BBOX_PADDING = 0.10  # запас вокруг box-а: 10% от размера
 CALIB_FACE_CHIN_INDEX = 152     # индекс подбородка (chin tip) в face_landmarker
 CALIB_MASK_OVERLAY_ALPHA = 0.5  # прозрачность маски InSPyReNet на визуализации
+# --- Прямоугольники конечностей на визуализации калибровки ---
+DRAW_CALIB_LIMBS = True                # рисовать прямоугольники рук и ног
+CALIB_ARM_COLOR = (255, 0, 255)        # цвет рук (BGR, пурпурный)
+CALIB_LEG_COLOR = (255, 255, 0)        # цвет ног (BGR, голубой)
+CALIB_PALM_COLOR = (255, 255, 255)     # цвет ладоней (BGR, белый)
+CALIB_FOOT_COLOR = (128, 128, 255)     # цвет ступней (BGR, светло-красный)
+CALIB_HIP_TRI_COLOR = (0, 0, 0)        # цвет треугольников таза (BGR, чёрный)
+CALIB_TORSO_TRI_COLOR = (0, 0, 128)    # цвет треугольников торс-нога (BGR, тёмно-красный)
+CALIB_THIGH_QUAD_COLOR = (0, 0, 128)   # цвет четырёхугольников бёдер (BGR, тёмно-красный)
+CALIB_UPPER_HULL_COLOR = (0, 128, 0)   # цвет многоугольника XABCDY (BGR, тёмно-зелёный)
+CALIB_ARM_TOPS_COLOR = (0, 128, 0)     # цвет четырёхугольника ABCD (BGR, тёмно-зелёный)
 DRAW_TRACKED_HEAD = True                             # рисовать отслеживаемую голову
 DRAW_TRACKED_TORSO = True                            # рисовать отслеживаемый торс
 DRAW_TRACKED_NECK = True                       # рисовать отслеживаемую шею
 TRACKED_NECK_COLOR = (255, 100, 0)             # цвет шеи (BGR)
 TRACKED_HEAD_COLOR = (255, 100, 0)                   # цвет головы (BGR)
 TRACKED_TORSO_COLOR = (255, 100, 0)                  # цвет торса (BGR)
+DRAW_TRACKED_PALMS = True                      # рисовать ладони при отслеживании
+DRAW_TRACKED_FEET = True                       # рисовать ступни при отслеживании
+TRACKED_PALM_COLOR = (255, 255, 255)           # цвет ладоней (BGR, белый)
+TRACKED_FOOT_COLOR = (128, 128, 255)           # цвет ступней (BGR, светло-красный)
 TRACKED_THICKNESS = 2                                # толщина контуров

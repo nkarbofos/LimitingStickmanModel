@@ -7,7 +7,7 @@
 import numpy as np
 
 from .stickman_model import (
-    _get_point_px, _rotate90,
+    _get_point_px, _rotate90, polygon_self_intersects,
     NOSE, LEFT_EAR, RIGHT_EAR, LEFT_SHOULDER, RIGHT_SHOULDER,
 )
 
@@ -81,7 +81,9 @@ def build_torso_quad_from_params(params, sh_l, sh_r, hip_l=None, hip_r=None):
     (has_hip_ref=True) — используем смещение относительно середины БЁДЕР.
     Иначе — фолбэк на смещение относительно середины ПЛЕЧ.
 
-    Возвращает четырёхугольник [TL, TR, BR, BL] как np.array (4, 2) или None.
+    Возвращает шестиугольник [TL, TR, MR, BR, BL, ML] как np.array (6, 2);
+    для старых калибровок без линии живота -- четырёхугольник (4, 2).
+    None, если ширина плеч вырождена.
     """
     sh_l = np.array(sh_l, dtype=np.float64)
     sh_r = np.array(sh_r, dtype=np.float64)
@@ -109,10 +111,22 @@ def build_torso_quad_from_params(params, sh_l, sh_r, hip_l=None, hip_r=None):
         hip_l = np.array(hip_l, dtype=np.float64)
         hip_r = np.array(hip_r, dtype=np.float64)
         hip_mid = (hip_l + hip_r) / 2.0
-        BL = hip_mid + np.array([params['dx_left_coef_hip'] * S_cur,
-                                 params['dy_left_coef_hip'] * S_cur], dtype=np.float64)
-        BR = hip_mid + np.array([params['dx_right_coef_hip'] * S_cur,
-                                 params['dy_right_coef_hip'] * S_cur], dtype=np.float64)
+        hip_width_cur = float(np.linalg.norm(hip_r - hip_l))
+        if params.get('hip_frame_ref', False) and hip_width_cur > 1e-6:
+            # Низ торса задан в базисе отрезка бёдер 23-24: поворачивается
+            # вместе с ним и остаётся ему параллелен.
+            u_hip = (hip_r - hip_l) / hip_width_cur
+            n_hip = _rotate90(u_hip)
+            BL = hip_mid + S_cur * (params['u_left_coef_hip'] * u_hip
+                                    + params['n_left_coef_hip'] * n_hip)
+            BR = hip_mid + S_cur * (params['u_right_coef_hip'] * u_hip
+                                    + params['n_right_coef_hip'] * n_hip)
+        else:
+            # Старые калибровки без базиса бёдер -- смещение в осях кадра.
+            BL = hip_mid + np.array([params['dx_left_coef_hip'] * S_cur,
+                                     params['dy_left_coef_hip'] * S_cur], dtype=np.float64)
+            BR = hip_mid + np.array([params['dx_right_coef_hip'] * S_cur,
+                                     params['dy_right_coef_hip'] * S_cur], dtype=np.float64)
     else:
         # Фолбэк: середина плеч
         BL = sh_mid + np.array([params['dx_left_coef'] * S_cur,
@@ -120,8 +134,37 @@ def build_torso_quad_from_params(params, sh_l, sh_r, hip_l=None, hip_r=None):
         BR = sh_mid + np.array([params['dx_right_coef'] * S_cur,
                                 params['dy_right_coef'] * S_cur], dtype=np.float64)
 
-    quad = np.array([TL, TR, BR, BL], dtype=np.float64)
-    return quad
+    # ВРЕМЕННО ОТКЛЮЧЕНО: линия живота не строится, контур торса --
+    # прежний четырёхугольник плечи-торс. Возврат стоит выше блока,
+    # чтобы шестиугольник не собирался и по старым калибровкам,
+    # где has_belly=True.
+    return np.array([TL, TR, BR, BL], dtype=np.float64)
+
+    # if not params.get('has_belly', False):
+    #     # Старые калибровки без линии живота -- прежний четырёхугольник.
+    #     return np.array([TL, TR, BR, BL], dtype=np.float64)
+
+    # # Линия живота: параллельна линии плеч, смещена по нормали к торсу, концы
+    # # отложены вдоль линии плеч на запомненные величины (как TL/TR от плеч).
+    # n_sh = _rotate90(u_shoulder)
+    # if float(np.dot(BL - TL, n_sh)) < 0:
+    #     n_sh = -n_sh
+    # # Глубина берётся с ТЕКУЩЕГО контура, поэтому линия всегда стоит на
+    # # запомненной доле расстояния плечи->торс, как бы ни изменилась поза.
+    # depth_cur = (float(np.dot(BL - TL, n_sh)) + float(np.dot(BR - TR, n_sh))) / 2.0
+    # belly_off = params['belly_depth_coef'] * depth_cur
+    # start_l = sh_l + belly_off * n_sh
+    # start_r = sh_r + belly_off * n_sh
+    # ML = start_l + params['belly_ext_left_coef'] * S_cur * u_shoulder
+    # MR = start_r - params['belly_ext_right_coef'] * S_cur * u_shoulder
+
+    # # Шестиугольник плечи-живот-торс. На отдельных кадрах поза может увести
+    # # линию живота так, что контур перекручивается, -- там отдаём прежний
+    # # четырёхугольник вместо битой фигуры.
+    # hexagon = np.array([TL, TR, MR, BR, BL, ML], dtype=np.float64)
+    # if polygon_self_intersects(hexagon):
+    #     return np.array([TL, TR, BR, BL], dtype=np.float64)
+    # return hexagon
 
 
 def build_neck_quad_from_torso_and_head(torso_quad, head_corners):

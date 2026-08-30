@@ -16,8 +16,11 @@ import json
 from . import config
 from .stickman_model import (
     _get_point_px, _rotate90, _build_limb_rect,
+    polygon_self_intersects,
     NOSE, LEFT_EAR, RIGHT_EAR, LEFT_SHOULDER, RIGHT_SHOULDER,
 )
+# tracking тянет только stickman_model, цикла импорта не возникает
+from .tracking import build_neck_quad_from_torso_and_head
 
 # Индексы точек позы для ног
 LEFT_HIP = 23
@@ -104,6 +107,18 @@ def _build_legs_mask(pose_landmarks, region, frame_w, frame_h, S):
     return legs_mask
 
 
+def _legs_visible(pose_landmarks, region, frame_w, frame_h):
+    """True, если обе ноги видны: бёдра (23, 24) и колени (25, 26).
+
+    Колени подтверждают, что ноги действительно попали в кадр, а не только
+    таз. Лодыжки не требуются -- ноги могут быть обрезаны нижней границей.
+    """
+    for idx in (LEFT_HIP, RIGHT_HIP, LEFT_KNEE, RIGHT_KNEE):
+        if _get_point_px(pose_landmarks, idx, region, frame_w, frame_h) is None:
+            return False
+    return True
+
+
 def _find_clothing_bottom(mask, pose_landmarks, region, frame_w, frame_h, S, y_hips):
     """Находит нижнюю границу свисающей одежды (y_bottom).
 
@@ -146,10 +161,108 @@ def _find_clothing_bottom(mask, pose_landmarks, region, frame_w, frame_h, S, y_h
     return y_bottom
 
 
+
+def _head_corners(nose, e1, e2, head_width, up, down):
+    """Углы прямоугольника головы в том же порядке, что и в calibrate_head.
+
+    [верхний правый, верхний левый, нижний левый, нижний правый].
+    up -- вверх от носа вдоль e2, down -- вниз (против e2).
+    """
+    hw = head_width / 2.0
+    return np.array([
+        nose + hw * e1 + up * e2,
+        nose - hw * e1 + up * e2,
+        nose - hw * e1 - down * e2,
+        nose + hw * e1 - down * e2,
+    ], dtype=np.float64)
+
+
+def _neck_band(nose, e2, torso_quad):
+    """Полоса между верхним ребром торса TL-TR и уровнем носа.
+
+    Возвращает (band_poly (4,2), h_torso) либо (None, 0.0), если верх торса
+    не ниже носа (полоса вырождена). h_torso -- высота полосы до ближайшей
+    из вершин TL/TR.
+    """
+    TL = np.asarray(torso_quad[0], dtype=np.float64)
+    TR = np.asarray(torso_quad[1], dtype=np.float64)
+    a_L = -float(np.dot(TL - nose, e2))   # >0, если TL ниже носа
+    a_R = -float(np.dot(TR - nose, e2))
+    if a_L <= 1.0 or a_R <= 1.0:
+        return None, 0.0
+    band_poly = np.array([TL, TR, TR + a_R * e2, TL + a_L * e2], dtype=np.float64)
+    return band_poly, min(a_L, a_R)
+
+
+def _fit_down_dist_by_neck_iou(mask, nose, e1, e2, head_width, len_XN, torso_quad):
+    """Подбирает down_dist по IoU фигуры (голова + шея) с маской.
+
+    Цель -- маска, ограниченная полосой между верхним ребром торса и уровнем
+    носа. Полоса от down_dist НЕ зависит и считается один раз, иначе метрика
+    вырождается. Кандидат -- объединение прямоугольника головы и
+    четырёхугольника шеи при данном down_dist, обрезанное той же полосой.
+
+    Возвращает (down_dist, iou, curve) или None, если подбор невозможен.
+    """
+    band_poly, h_torso = _neck_band(nose, e2, torso_quad)
+    if band_poly is None:
+        return None
+
+    d_lo = config.CALIBRATION_NECK_FIT_MIN_COEF * len_XN
+    d_hi = min(config.CALIBRATION_NECK_FIT_MAX_COEF * len_XN,
+               h_torso - config.CALIBRATION_NECK_FIT_MARGIN_PX)
+    if d_hi <= d_lo:
+        return None
+
+    # ROI по bounding box полосы -- растеризовать весь кадр незачем
+    h, w = mask.shape[:2]
+    x0 = max(0, int(np.floor(band_poly[:, 0].min())) - 2)
+    y0 = max(0, int(np.floor(band_poly[:, 1].min())) - 2)
+    x1 = min(w, int(np.ceil(band_poly[:, 0].max())) + 3)
+    y1 = min(h, int(np.ceil(band_poly[:, 1].max())) + 3)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    org = np.array([x0, y0], dtype=np.float64)
+
+    band_roi = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.fillPoly(band_roi, [(band_poly - org).astype(np.int32)], 255)
+    target = cv2.bitwise_and(band_roi, mask[y0:y1, x0:x1])
+    area_t = int(cv2.countNonZero(target))
+    if area_t == 0:
+        return None
+
+    buf = np.empty_like(target)
+    step = max(0.25, float(config.CALIBRATION_NECK_FIT_STEP_PX))
+    best, curve = None, []
+    d = d_lo
+    while d <= d_hi + 1e-9:
+        corners = _head_corners(nose, e1, e2, head_width, len_XN, d)
+        neck = build_neck_quad_from_torso_and_head(torso_quad, corners)
+        buf[:] = 0
+        cv2.fillPoly(buf, [(corners - org).astype(np.int32)], 255)
+        if neck is not None:
+            cv2.fillPoly(buf, [(neck - org).astype(np.int32)], 255)
+        # фигура обрезается полосой: верх головы выше носа в цель не входит
+        cv2.bitwise_and(buf, band_roi, dst=buf)
+        area_q = int(cv2.countNonZero(buf))
+        inter = int(cv2.countNonZero(cv2.bitwise_and(buf, target)))
+        union = area_t + area_q - inter
+        iou = inter / union if union > 0 else 0.0
+        curve.append((d, iou))
+        if best is None or iou > best[1]:
+            best = (d, iou)
+        d += step
+
+    if best is None:
+        return None
+    return best[0], best[1], curve
+
+
 # ------------------------------------------------------------------
 # Калибровка головы
 # ------------------------------------------------------------------
-def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h, chin_point=None):
+def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h,
+                   chin_point=None, torso_quad=None):
     """Калибрует голову по маске InSPyReNet.
 
     Прямоугольник головы:
@@ -236,20 +349,28 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h, chin_point=No
         else:
             # подбородок выше носа (неожиданно) - используем len_XN
             down_dist = len_XN
+        down_source = 'chin'
+        neck_fit = None
     else:
-        down_dist = len_XN  # подбородок не доступен - симметрично
+        # Подбородка нет: опускаем нижнюю границу, пока фигура (голова + шея)
+        # не станет точнее всего закрывать маску между торсом и головой.
+        down_dist = len_XN            # прежнее поведение как запасное
+        down_source = 'symmetric'
+        neck_fit = None
+        if config.CALIBRATION_NECK_FIT_ENABLED and torso_quad is not None:
+            neck_fit = _fit_down_dist_by_neck_iou(
+                mask, nose, e1, e2, head_width, len_XN,
+                np.asarray(torso_quad, dtype=np.float64))
+            if neck_fit is not None:
+                down_dist = float(neck_fit[0])
+                down_source = 'neck_iou'
 
     # Высота головы: вверх len_XN, вниз down_dist
     head_height = len_XN + down_dist
 
-    # Прямоугольник головы (несимметричный относительно носа)
-    hw = head_width / 2.0
-    corners = np.array([
-        nose + hw * e1 + len_XN * e2,      # верхний правый
-        nose - hw * e1 + len_XN * e2,      # верхний левый
-        nose - hw * e1 - down_dist * e2,   # нижний левый
-        nose + hw * e1 - down_dist * e2,   # нижний правый
-    ], dtype=np.float64)
+    # Прямоугольник головы (несимметричный относительно носа).
+    # Та же сборка, что и в переборе _fit_down_dist_by_neck_iou -- один источник.
+    corners = _head_corners(nose, e1, e2, head_width, len_XN, down_dist)
 
     return {
         'center': nose,
@@ -260,6 +381,8 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h, chin_point=No
         'corners': corners,
         'len_XN': len_XN,
         'down_dist': down_dist,
+        'down_source': down_source,
+        'neck_fit': neck_fit,
         'left_boundary': left_boundary,
         'right_boundary': right_boundary,
         'k_hw': head_width / S if S > 1e-6 else 0.45,
@@ -270,17 +393,32 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h, chin_point=No
 # ------------------------------------------------------------------
 # Калибровка торса
 # ------------------------------------------------------------------
-def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h):
+def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
+                    barrier_rects=None):
     """Калибрует торс (четырёхугольник плечи-торс) по маске InSPyReNet.
 
     - Верхние вершины (TL, TR): от точек плеч идём наружу (влево/вправо)
       до границы маски на уровне плеч.
-    - Нижняя граница y_bottom: находится через вычитание модели ног и порог
-      W_extra (свисающая одежда).
-    - Нижние вершины (BL, BR): от x-координат бёдер на уровне y_bottom идём
-      наружу (влево/вправо) до границы маски.
+    - Нижние вершины (BL, BR):
+        * ноги видны -- точки бёдер сперва опускаются перпендикулярно линии
+          торса 23-24 на STICKMAN_TORSO_EXTEND_COEF * S, а затем от них идём
+          наружу ВДОЛЬ отрезка бёдер до границы маски (аналогия с TL/TR на
+          отрезке плеч); y_bottom при этом задаётся самими вершинами;
+        * ноги не видны -- прежняя логика: y_bottom ищется через вычитание
+          модели ног и порог W_extra (свисающая одежда), а BL/BR берутся
+          от x-координат бёдер на уровне y_bottom наружу до границы маски.
+
+    barrier_rects -- список прямоугольников (рук и ладоней), сквозь которые
+    вытягивание BL/BR не проходит: движение останавливается либо на границе
+    маски, либо при входе в такой прямоугольник. Прямоугольники ног в барьер
+    НЕ входят. None -- барьера нет.
+
+    - Линия живота (ML, MR): параллельна линии плеч, отстоит от неё на
+      CALIBRATION_BELLY_COEF среднего перпендикулярного расстояния до линии
+      торса; концы найдены вытягиванием до границы маски, как у TL/TR.
 
     Возвращает dict с параметрами торса или None (если плечи не видны).
+    Ключ 'quad' -- ШЕСТИугольник [TL, TR, MR, BR, BL, ML].
     """
     sh_l = _get_point_px(pose_landmarks, LEFT_SHOULDER, region, frame_w, frame_h)
     sh_r = _get_point_px(pose_landmarks, RIGHT_SHOULDER, region, frame_w, frame_h)
@@ -311,26 +449,102 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h):
     TL = _find_mask_boundary_along(mask, sh_l, u_shoulder, max_extend_shoulder)
     TR = _find_mask_boundary_along(mask, sh_r, -u_shoulder, max_extend_shoulder)
 
-    # Нижняя граница свисающей одежды
-    y_bottom = _find_clothing_bottom(mask, pose_landmarks, region, frame_w, frame_h, S, y_hips)
+    # Нижние вершины (BL, BR).
+    #
+    # Если ноги видны, свисающей одежды под торсом фактически нет (её
+    # закрывают сами ноги), поэтому _find_clothing_bottom не используется:
+    # нижнюю сторону строим так же, как верхнюю, только на отрезке бёдер --
+    # идём от каждого бедра ВДОЛЬ отрезка 23-24 до границы маски.
+    legs_visible = (hip_l is not None and hip_r is not None
+                    and _legs_visible(pose_landmarks, region, frame_w, frame_h))
 
-    # Нижние вершины: от x-координат бёдер на уровне y_bottom идём наружу
-    if hip_l is not None:
-        x_BL = _find_mask_boundary_x(mask, hip_l[0], y_bottom, direction=-1)
-        BL = np.array([x_BL, y_bottom], dtype=np.float64)
+    hip_width = (float(np.linalg.norm(hip_r - hip_l))
+                 if hip_l is not None and hip_r is not None else 0.0)
+
+    if legs_visible and hip_width > 1e-6:
+        u_hip = (hip_r - hip_l) / hip_width
+        max_extend_hip = config.CALIBRATION_HIP_EXTEND_COEF * S
+        # Барьер: внутрь прямоугольников рук и ладоней не заходим -- вырезаем
+        # их из маски, тогда обычный поиск границы сам остановится на них.
+        walk_mask = mask
+        if barrier_rects:
+            barrier = np.zeros(mask.shape[:2], dtype=np.uint8)
+            for rect in barrier_rects:
+                cv2.fillPoly(barrier, [np.asarray(rect, dtype=np.int32)], 255)
+            walk_mask = np.where(barrier > 0, 0, mask).astype(np.uint8)
+        # Перед вытягиванием опускаем сами точки бёдер перпендикулярно линии
+        # торса 23-24 на STICKMAN_TORSO_EXTEND_COEF * S. Из двух нормалей
+        # берём ту, что направлена от плеч (вниз по телу), иначе торс
+        # укоротился бы вместо удлинения.
+        n_hip = _rotate90(u_hip)
+        if np.dot(n_hip, (hip_l + hip_r) / 2.0 - (sh_l + sh_r) / 2.0) < 0:
+            n_hip = -n_hip
+        drop = config.STICKMAN_TORSO_EXTEND_COEF * S
+        hip_l_low = hip_l + n_hip * drop
+        hip_r_low = hip_r + n_hip * drop
+
+        BL = _find_mask_boundary_along(walk_mask, hip_l_low, u_hip, max_extend_hip)
+        BR = _find_mask_boundary_along(walk_mask, hip_r_low, -u_hip, max_extend_hip)
+        # y_bottom больше не ищется по одежде -- он задаётся самими вершинами
+        y_bottom = (BL[1] + BR[1]) / 2.0
     else:
-        x_BL = _find_mask_boundary_x(mask, sh_l[0], y_bottom, direction=-1)
-        BL = np.array([x_BL, y_bottom], dtype=np.float64)
+        legs_visible = False
+        # Ноги не видны: прежняя логика -- нижняя граница свисающей одежды
+        y_bottom = _find_clothing_bottom(mask, pose_landmarks, region,
+                                         frame_w, frame_h, S, y_hips)
 
-    if hip_r is not None:
-        x_BR = _find_mask_boundary_x(mask, hip_r[0], y_bottom, direction=+1)
-        BR = np.array([x_BR, y_bottom], dtype=np.float64)
-    else:
-        x_BR = _find_mask_boundary_x(mask, sh_r[0], y_bottom, direction=+1)
-        BR = np.array([x_BR, y_bottom], dtype=np.float64)
+        # Нижние вершины: от x-координат бёдер на уровне y_bottom идём наружу
+        x_start_l = hip_l[0] if hip_l is not None else sh_l[0]
+        x_start_r = hip_r[0] if hip_r is not None else sh_r[0]
+        BL = np.array([_find_mask_boundary_x(mask, x_start_l, y_bottom, direction=-1),
+                       y_bottom], dtype=np.float64)
+        BR = np.array([_find_mask_boundary_x(mask, x_start_r, y_bottom, direction=+1),
+                       y_bottom], dtype=np.float64)
 
-    # Четырёхугольник: TL, TR, BR, BL (обход по контуру)
-    quad = np.array([TL, TR, BR, BL], dtype=np.float64)
+    # --- Линия живота ---------------------------------------------------
+    # Параллельна линии плеч, отстоит от неё на CALIBRATION_BELLY_COEF среднего
+    # ПЕРПЕНДИКУЛЯРНОГО расстояния до линии торса. Требования "2/3 расстояния" и
+    # "параллельно плечам" совместимы только для трапеции, а торс ей не является
+    # (на развёрнутом корпусе линии плеч и торса расходятся на десятки градусов),
+    # поэтому смещение задаётся именно по нормали, а не вдоль боковых рёбер.
+    # Концы ML/MR ищутся вытягиванием до границы маски -- как TL/TR от плеч.
+    # ВРЕМЕННО ОТКЛЮЧЕНО: контур торса снова четырёхугольник плечи-торс.
+    # Чтобы вернуть шестиугольник -- раскомментировать блок ниже и убрать
+    # эти четыре присваивания (в tracking.py -- аналогично).
+    ML = MR = None
+    belly_depth_coef = belly_ext_left_coef = belly_ext_right_coef = 0.0
+    belly_ok = False
+
+    # n_sh = _rotate90(u_shoulder)
+    # if float(np.dot(BL - TL, n_sh)) < 0:
+    #     n_sh = -n_sh                      # нормаль направлена от плеч к торсу
+    # depth = (float(np.dot(BL - TL, n_sh)) + float(np.dot(BR - TR, n_sh))) / 2.0
+    # belly_off = config.CALIBRATION_BELLY_COEF * depth
+    # belly_start_l = sh_l + belly_off * n_sh
+    # belly_start_r = sh_r + belly_off * n_sh
+    # max_extend_belly = config.CALIBRATION_BELLY_EXTEND_COEF * S
+    # ML = _find_mask_boundary_along(mask, belly_start_l, u_shoulder, max_extend_belly)
+    # MR = _find_mask_boundary_along(mask, belly_start_r, -u_shoulder, max_extend_belly)
+
+    # # Доля именно от ГЛУБИНЫ плечи->торс, а не от S: при отслеживании глубина
+    # # задаётся восстановленными BL/BR и меняется не пропорционально ширине
+    # # плеч, поэтому доля от S уводила бы линию (на развёрнутом корпусе -- на
+    # # десятки пикселей).
+    # belly_depth_coef = belly_off / depth if abs(depth) > 1e-6 else 0.0
+    # ext_l = float(np.linalg.norm(ML - belly_start_l))
+    # ext_r = float(np.linalg.norm(MR - belly_start_r))
+    # belly_ext_left_coef = ext_l / S if S > 1e-6 else 0.0
+    # belly_ext_right_coef = ext_r / S if S > 1e-6 else 0.0
+
+    # # Линия живота годится не всегда. Если стартовая точка вытягивания попала
+    # # ВНЕ маски (сильно развёрнутый или укороченный ракурсом торс), то
+    # # _find_mask_boundary_along возвращает сам старт, вытягивания не было и
+    # # линия схлопывается; шестиугольник в таком случае ещё и перекручивается.
+    # # Тогда честнее отдать прежний четырёхугольник, чем битую фигуру.
+    # belly_ok = ext_l > 1e-6 and ext_r > 1e-6
+    # if belly_ok:
+    #     belly_ok = not polygon_self_intersects(
+    #         np.array([TL, TR, MR, BR, BL, ML], dtype=np.float64))
 
     # --- Параметры для отслеживания (нормализованные на ширину плеч S) ---
     # Верхние точки: фактическое продление плеч (доли от S)
@@ -360,15 +574,39 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h):
         dx_right_coef_hip = 0.0
         dy_right_coef_hip = 0.0
 
-    # Четырёхугольник: TL, TR, BR, BL (обход по контуру)
-    quad = np.array([TL, TR, BR, BL], dtype=np.float64)
+    # Нижние точки в СОБСТВЕННОМ базисе отрезка бёдер 23-24: вдоль отрезка (u)
+    # и по нормали к нему (n). Благодаря этому при отслеживании низ торса
+    # поворачивается вместе с отрезком бёдер и остаётся ему параллелен, а не
+    # держит фиксированное направление в осях кадра.
+    # Базис детерминирован (u из 23->24, n = _rotate90(u)), поэтому калибровка
+    # и отслеживание строят его одинаково -- неоднозначности знака нет.
+    # Пишется только для ветки, где BL/BR и строились по отрезку бёдер.
+    hip_frame_ref = bool(legs_visible and hip_width > 1e-6)
+    u_left_coef_hip = n_left_coef_hip = 0.0
+    u_right_coef_hip = n_right_coef_hip = 0.0
+    if hip_frame_ref and S > 1e-6:
+        u_hip_ref = (hip_r - hip_l) / hip_width
+        n_hip_ref = _rotate90(u_hip_ref)
+        hip_mid_ref = (hip_l + hip_r) / 2.0
+        u_left_coef_hip = float(np.dot(BL - hip_mid_ref, u_hip_ref)) / S
+        n_left_coef_hip = float(np.dot(BL - hip_mid_ref, n_hip_ref)) / S
+        u_right_coef_hip = float(np.dot(BR - hip_mid_ref, u_hip_ref)) / S
+        n_right_coef_hip = float(np.dot(BR - hip_mid_ref, n_hip_ref)) / S
+
+    # Шестиугольник плечи-живот-торс, либо прежний четырёхугольник, если
+    # линия живота вырождена (см. belly_ok выше).
+    if belly_ok:
+        quad = np.array([TL, TR, MR, BR, BL, ML], dtype=np.float64)
+    else:
+        quad = np.array([TL, TR, BR, BL], dtype=np.float64)
 
     return {
         'quad': quad,
-        'TL': TL, 'TR': TR, 'BR': BR, 'BL': BL,
+        'TL': TL, 'TR': TR, 'BR': BR, 'BL': BL, 'ML': ML, 'MR': MR,
         'y_shoulders': y_shoulders,
         'y_hips': y_hips,
         'y_bottom': y_bottom,
+        'legs_visible': legs_visible,
         'S': S,
         # Нормализованные параметры для отслеживания
         'S_ref': S,
@@ -385,6 +623,17 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h):
         'dy_left_coef_hip': dy_left_coef_hip,
         'dx_right_coef_hip': dx_right_coef_hip,
         'dy_right_coef_hip': dy_right_coef_hip,
+        # Базис отрезка бёдер: низ торса поворачивается вместе с 23-24
+        'hip_frame_ref': hip_frame_ref,
+        'u_left_coef_hip': u_left_coef_hip,
+        'n_left_coef_hip': n_left_coef_hip,
+        'u_right_coef_hip': u_right_coef_hip,
+        'n_right_coef_hip': n_right_coef_hip,
+        # Линия живота (концы -- вершины ML, MR шестиугольника)
+        'has_belly': belly_ok,
+        'belly_depth_coef': belly_depth_coef,
+        'belly_ext_left_coef': belly_ext_left_coef,
+        'belly_ext_right_coef': belly_ext_right_coef,
         'sh_mid': sh_mid,
     }
 
@@ -477,6 +726,17 @@ def save_calibration_params(filepath, head_result, torso_result,
             'dy_left_coef_hip': float(torso_result.get('dy_left_coef_hip', 0.0)),
             'dx_right_coef_hip': float(torso_result.get('dx_right_coef_hip', 0.0)),
             'dy_right_coef_hip': float(torso_result.get('dy_right_coef_hip', 0.0)),
+            # Базис отрезка бёдер (низ торса поворачивается вместе с 23-24)
+            'hip_frame_ref': bool(torso_result.get('hip_frame_ref', False)),
+            'u_left_coef_hip': float(torso_result.get('u_left_coef_hip', 0.0)),
+            'n_left_coef_hip': float(torso_result.get('n_left_coef_hip', 0.0)),
+            'u_right_coef_hip': float(torso_result.get('u_right_coef_hip', 0.0)),
+            'n_right_coef_hip': float(torso_result.get('n_right_coef_hip', 0.0)),
+            # Линия живота: вершины ML/MR шестиугольника торса
+            'has_belly': bool(torso_result.get('has_belly', False)),
+            'belly_depth_coef': float(torso_result.get('belly_depth_coef', 0.0)),
+            'belly_ext_left_coef': float(torso_result.get('belly_ext_left_coef', 0.0)),
+            'belly_ext_right_coef': float(torso_result.get('belly_ext_right_coef', 0.0)),
         }
 
     with open(filepath, 'w') as f:

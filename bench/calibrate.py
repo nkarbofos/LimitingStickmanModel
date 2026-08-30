@@ -23,6 +23,14 @@ import cv2
 import numpy as np
 from PIL import Image
 
+# ВАЖНО: transparent_background (torch) обязан импортироваться ДО mediapipe.
+# При обратном порядке процесс падает с SIGSEGV на импорте
+# transparent_background -- конфликт нативных библиотек torch и mediapipe.
+try:
+    from transparent_background import Remover as _Remover
+except ImportError:
+    _Remover = None
+
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
@@ -30,19 +38,58 @@ from mediapipe.tasks.python import vision
 from . import config
 from .calibration import calibrate_head, calibrate_torso, save_calibration_params
 from .download import ensure_models
+from .stickman_model import build_body_rects, build_thigh_quads
 from .tracking import build_neck_quad_from_torso_and_head
 from .visualization import draw_pose_landmarks
 
 
+
+
+# Группы прямоугольников тела: ключ -> (подпись, цвет из config)
+_RECT_GROUPS = (
+    ('arms',  'руки',    'CALIB_ARM_COLOR'),
+    ('legs',  'ноги',    'CALIB_LEG_COLOR'),
+    ('palms', 'ладони',  'CALIB_PALM_COLOR'),
+    ('feet',  'ступни',  'CALIB_FOOT_COLOR'),
+    ('thigh_quads', 'четыр. бёдер', 'CALIB_THIGH_QUAD_COLOR'),
+    ('arm_tops_quad', 'четыр. ABCD', 'CALIB_ARM_TOPS_COLOR'),
+)
+
+
+def draw_body_rects(overlay, body_rects):
+    """Рисует прямоугольники рук, ног, ладоней и ступней.
+
+    body_rects -- результат stickman_model.build_body_rects (или None).
+    Возвращает общее число нарисованных прямоугольников.
+    """
+    if body_rects is None:
+        print("\nПрямоугольники тела: плечи не видны -- ничего не построено")
+        return 0
+
+    total = 0
+    parts = []
+    for key, label, color_name in _RECT_GROUPS:
+        rects = body_rects.get(key, [])
+        color = getattr(config, color_name)
+        for rect in rects:
+            cv2.polylines(overlay, [np.asarray(rect, dtype=np.int32)],
+                          isClosed=True, color=color,
+                          thickness=config.TRACKED_THICKNESS)
+        total += len(rects)
+        parts.append(f"{label} {len(rects)}")
+
+    print(f"\nПрямоугольники тела: {total} шт ({', '.join(parts)}), "
+          f"S={body_rects['S']:.1f} px")
+    return total
+
+
 def load_inspyrenet():
-    try:
-        from transparent_background import Remover
-    except ImportError:
+    if _Remover is None:
         print("[!] Не установлен transparent-background (InSPyReNet).")
         print("    Установите: pip install -e \".[calib]\"")
         return None
     print("Загрузка InSPyReNet...")
-    return Remover(mode='base', jit=False)
+    return _Remover(mode='base', jit=False)
 
 
 def get_inspyrenet_mask(remover, frame_bgr):
@@ -195,31 +242,80 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     print("РЕЗУЛЬТАТЫ КАЛИБРОВКИ")
     print("=" * 50)
 
+    # Прямоугольники частей тела считаем ДО калибровки торса: руки и ладони
+    # служат барьером для вытягивания нижних вершин торса (BL, BR).
+    body_rects = build_body_rects(pose_landmarks, region, frame_w, frame_h)
+    barrier_rects = None
+    if body_rects is not None:
+        barrier_rects = body_rects['arms'] + body_rects['palms']
+
+    torso_result = calibrate_torso(mask_full, pose_landmarks, region,
+                                   frame_w, frame_h,
+                                   barrier_rects=barrier_rects)
+
+    # Четырёхугольники верха ног: строятся только после торса -- им нужны
+    # его нижние вершины BL и BR.
+    if body_rects is not None:
+        body_rects['thigh_quads'] = build_thigh_quads(
+            pose_landmarks, region, frame_w, frame_h,
+            torso_result['quad'] if torso_result is not None else None)
+
+    # Голова считается ПОСЛЕ торса: при отсутствии подбородка нижняя граница
+    # головы подбирается по тому, как фигура (голова + шея) ложится на маску,
+    # а шея строится из верхнего ребра торса.
     head_result = calibrate_head(mask_full, pose_landmarks, region,
-                                 frame_w, frame_h, chin_point=chin_point)
+                                 frame_w, frame_h, chin_point=chin_point,
+                                 torso_quad=(torso_result['quad']
+                                             if torso_result is not None else None))
+
     if head_result is not None:
         print("\nГолова:")
         print(f"  Ширина (продление ушей): {head_result['width']:.1f} px")
         print(f"  Высота:                  {head_result['height']:.1f} px")
         print(f"  len(XN) вверх:           {head_result['len_XN']:.1f} px")
-        print(f"  down_dist (до подбородка): {head_result['down_dist']:.1f} px")
+        src = head_result['down_source']
+        src_ru = {'chin': 'по подбородку',
+                  'neck_iou': 'подобран по шее',
+                  'symmetric': 'заглушка len_XN'}.get(src, src)
+        print(f"  down_dist:               {head_result['down_dist']:.1f} px ({src_ru})")
+        fit = head_result.get('neck_fit')
+        if fit is not None:
+            d_best, iou_best, curve = fit
+            at_bound = (d_best <= curve[0][0] + 1e-6
+                        or d_best >= curve[-1][0] - 1e-6)
+            print(f"    IoU(голова+шея) = {iou_best:.3f}, кандидатов {len(curve)} "
+                  f"в диапазоне {curve[0][0]:.1f}..{curve[-1][0]:.1f} px; "
+                  f"заглушка дала бы {head_result['len_XN']:.1f} px")
+            if at_bound:
+                print("    [!] оптимум на границе диапазона -- подбор вырожден")
+            if config.CALIBRATION_NECK_FIT_DEBUG:
+                print("    кривая IoU(d): "
+                      + " ".join(f"{d:.0f}:{v:.3f}" for d, v in curve))
         print(f"  k_hw: {head_result['k_hw']:.3f}, k_hh: {head_result['k_hh']:.3f}")
         print(f"  S (ширина плеч): {head_result['S']:.1f} px")
     else:
         print("\nГолова: пропущена (уши или нос не видны)")
 
-    torso_result = calibrate_torso(mask_full, pose_landmarks, region, frame_w, frame_h)
     if torso_result is not None:
         print("\nТорс:")
         print(f"  y_shoulders: {torso_result['y_shoulders']:.1f} px")
         print(f"  y_hips:      {torso_result['y_hips']:.1f} px")
         print(f"  y_bottom:    {torso_result['y_bottom']:.1f} px")
+        print(f"  ноги видны:  {torso_result['legs_visible']} "
+              f"({'BL/BR по отрезку бёдер' if torso_result['legs_visible'] else 'BL/BR по свисающей одежде'})")
         print(f"  S (ширина плеч): {torso_result['S']:.1f} px")
-        print(f"  Четырёхугольник:")
+        print(f"  Контур торса ({len(torso_result['quad'])} вершин):")
         print(f"    TL = {torso_result['TL'].astype(int).tolist()}")
         print(f"    TR = {torso_result['TR'].astype(int).tolist()}")
         print(f"    BR = {torso_result['BR'].astype(int).tolist()}")
         print(f"    BL = {torso_result['BL'].astype(int).tolist()}")
+        if torso_result.get('has_belly'):
+            print(f"  Линия живота (вершины шестиугольника):")
+            print(f"    ML = {torso_result['ML'].astype(int).tolist()}")
+            print(f"    MR = {torso_result['MR'].astype(int).tolist()}")
+            print(f"    belly_depth_coef:     {torso_result['belly_depth_coef']:.4f}")
+            print(f"    belly_ext_left_coef:  {torso_result['belly_ext_left_coef']:.4f}")
+            print(f"    belly_ext_right_coef: {torso_result['belly_ext_right_coef']:.4f}")
         print(f"  Параметры для отслеживания (нормализованные):")
         print(f"    ext_left_coef:  {torso_result['ext_left_coef']:.4f}")
         print(f"    ext_right_coef: {torso_result['ext_right_coef']:.4f}")
@@ -283,6 +379,10 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
                           isClosed=True,
                           color=config.TRACKED_NECK_COLOR,
                           thickness=config.TRACKED_THICKNESS)
+
+    # Руки, ноги, ладони, ступни (прямоугольники частей тела)
+    if config.DRAW_CALIB_LIMBS:
+        draw_body_rects(overlay, body_rects)
 
     # Скелет (поверх всего)
     overlay = draw_pose_landmarks(overlay, pose_result.pose_landmarks, region)

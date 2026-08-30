@@ -20,7 +20,8 @@ from .visualization import (category_mask_to_colored, confidence_masks_to_heatma
                             fill_poly_with_alpha)
 from .stats import print_latency_stats
 from .download import ensure_models
-from .stickman_model import build_stickman_mask, overlay_stickman
+from .stickman_model import (build_stickman_mask, overlay_stickman,
+                             build_body_rects)
 from .calibration import load_calibration_params
 from .tracking import build_head_rect_from_params, build_torso_quad_from_params, build_neck_quad_from_torso_and_head
 from .stickman_model import LEFT_SHOULDER, RIGHT_SHOULDER, _get_point_px
@@ -297,10 +298,33 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                     blended = cv2.addWeighted(overlay, 0.5, mask_full, 0.5, 0)
                     overlay[mask_bool] = blended[mask_bool]
 
+            # Отслеживаемый торс считаем заранее: он нужен и маске stickman
+            # (треугольники торс-нога), и блоку отслеживания ниже.
+            tracked_head_corners = None
+            if calib_params is not None and calib_params.get('head') is not None \
+                    and pose_result is not None and pose_result.pose_landmarks:
+                tracked_head_corners = build_head_rect_from_params(
+                    calib_params['head'], pose_result.pose_landmarks[0],
+                    region, width, height)
+
+            tracked_torso_quad = None
+            if calib_params is not None and calib_params.get('torso') is not None \
+                    and pose_result is not None and pose_result.pose_landmarks:
+                _lm = pose_result.pose_landmarks[0]
+                _sh_l = _get_point_px(_lm, LEFT_SHOULDER, region, width, height)
+                _sh_r = _get_point_px(_lm, RIGHT_SHOULDER, region, width, height)
+                if _sh_l is not None and _sh_r is not None:
+                    tracked_torso_quad = build_torso_quad_from_params(
+                        calib_params['torso'], _sh_l, _sh_r,
+                        hip_l=_get_point_px(_lm, LEFT_HIP, region, width, height),
+                        hip_r=_get_point_px(_lm, RIGHT_HIP, region, width, height))
+
             # --- Модель stickman (поверх тепловой карты, под скелетом) ---
             if config.DRAW_STICKMAN and pose_result is not None and pose_result.pose_landmarks:
                 stickman_mask = build_stickman_mask(
-                    pose_result.pose_landmarks, region, width, height)
+                    pose_result.pose_landmarks, region, width, height,
+                    torso_quad=tracked_torso_quad,
+                    head_corners=tracked_head_corners)
                 if stickman_mask is not None:
                     overlay = overlay_stickman(
                         overlay, stickman_mask,
@@ -320,21 +344,11 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                 head_corners = None
                 torso_quad = None
 
-                # Голова
-                if calib_params.get('head') is not None:
-                    head_corners = build_head_rect_from_params(
-                        calib_params['head'], pose_lm, region, width, height)
+                # Голова -- посчитана выше (нужна была маске stickman)
+                head_corners = tracked_head_corners
 
-                # Торс
-                if calib_params.get('torso') is not None:
-                    sh_l_cur = _get_point_px(pose_lm, LEFT_SHOULDER, region, width, height)
-                    sh_r_cur = _get_point_px(pose_lm, RIGHT_SHOULDER, region, width, height)
-                    hip_l_cur = _get_point_px(pose_lm, LEFT_HIP, region, width, height)
-                    hip_r_cur = _get_point_px(pose_lm, RIGHT_HIP, region, width, height)
-                    if sh_l_cur is not None and sh_r_cur is not None:
-                        torso_quad = build_torso_quad_from_params(
-                            calib_params['torso'], sh_l_cur, sh_r_cur,
-                            hip_l=hip_l_cur, hip_r=hip_r_cur)
+                # Торс -- посчитан выше (нужен был маске stickman)
+                torso_quad = tracked_torso_quad
 
                 # Шея (из торса и головы)
                 neck_quad = None
@@ -352,7 +366,30 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                     overlay = fill_poly_with_alpha(overlay, head_corners,
                                                    config.STICKMAN_COLOR, config.STICKMAN_ALPHA)
 
+                # Ладони и ступни: строятся прямо из точек позы, калибровка
+                # для них не нужна (ширина -- доля от плеч / таза).
+                body_rects = None
+                if config.DRAW_TRACKED_PALMS or config.DRAW_TRACKED_FEET:
+                    body_rects = build_body_rects(pose_lm, region, width, height)
+                if body_rects is not None:
+                    tracked_extra = []
+                    if config.DRAW_TRACKED_PALMS:
+                        tracked_extra.append((body_rects['palms'], config.TRACKED_PALM_COLOR))
+                    if config.DRAW_TRACKED_FEET:
+                        tracked_extra.append((body_rects['feet'], config.TRACKED_FOOT_COLOR))
+                    for rects_group, _color in tracked_extra:
+                        for rect in rects_group:
+                            overlay = fill_poly_with_alpha(
+                                overlay, np.asarray(rect, dtype=np.float64),
+                                config.STICKMAN_COLOR, config.STICKMAN_ALPHA)
+
                 # Контуры фигур (поверх заполнения)
+                if body_rects is not None:
+                    for rects_group, color in tracked_extra:
+                        for rect in rects_group:
+                            cv2.polylines(overlay, [np.asarray(rect, dtype=np.int32)],
+                                          isClosed=True, color=color,
+                                          thickness=config.TRACKED_THICKNESS)
                 if config.DRAW_TRACKED_TORSO and torso_quad is not None:
                     cv2.polylines(overlay, [torso_quad.astype(np.int32)],
                                   isClosed=True,
