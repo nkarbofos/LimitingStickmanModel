@@ -16,7 +16,8 @@ import json
 from . import config
 from .stickman_model import (
     _get_point_px, _rotate90, _build_limb_rect,
-    polygon_self_intersects,
+    polygon_self_intersects, limb_scale,
+    ARM_PAIRS, SHIN_PAIRS,
     NOSE, LEFT_EAR, RIGHT_EAR, LEFT_SHOULDER, RIGHT_SHOULDER,
 )
 # tracking тянет только stickman_model, цикла импорта не возникает
@@ -162,18 +163,19 @@ def _find_clothing_bottom(mask, pose_landmarks, region, frame_w, frame_h, S, y_h
 
 
 
-def _head_corners(nose, e1, e2, head_width, up, down):
+def _head_corners(nose, e1, e2, right, left, up, down):
     """Углы прямоугольника головы в том же порядке, что и в calibrate_head.
 
     [верхний правый, верхний левый, нижний левый, нижний правый].
-    up -- вверх от носа вдоль e2, down -- вниз (против e2).
+    Все четыре размера -- расстояния ОТ НОСА: right вдоль +e1, left вдоль -e1,
+    up вдоль +e2, down вдоль -e2. Прямоугольник не обязан быть симметричным
+    относительно носа: при повороте головы нос смещён с середины линии ушей.
     """
-    hw = head_width / 2.0
     return np.array([
-        nose + hw * e1 + up * e2,
-        nose - hw * e1 + up * e2,
-        nose - hw * e1 - down * e2,
-        nose + hw * e1 - down * e2,
+        nose + right * e1 + up * e2,
+        nose - left * e1 + up * e2,
+        nose - left * e1 - down * e2,
+        nose + right * e1 - down * e2,
     ], dtype=np.float64)
 
 
@@ -194,7 +196,7 @@ def _neck_band(nose, e2, torso_quad):
     return band_poly, min(a_L, a_R)
 
 
-def _fit_down_dist_by_neck_iou(mask, nose, e1, e2, head_width, len_XN, torso_quad):
+def _fit_down_dist_by_neck_iou(mask, nose, e1, e2, right, left, len_XN, torso_quad):
     """Подбирает down_dist по IoU фигуры (голова + шея) с маской.
 
     Цель -- маска, ограниченная полосой между верхним ребром торса и уровнем
@@ -236,7 +238,7 @@ def _fit_down_dist_by_neck_iou(mask, nose, e1, e2, head_width, len_XN, torso_qua
     best, curve = None, []
     d = d_lo
     while d <= d_hi + 1e-9:
-        corners = _head_corners(nose, e1, e2, head_width, len_XN, d)
+        corners = _head_corners(nose, e1, e2, right, left, len_XN, d)
         neck = build_neck_quad_from_torso_and_head(torso_quad, corners)
         buf[:] = 0
         cv2.fillPoly(buf, [(corners - org).astype(np.int32)], 255)
@@ -307,11 +309,25 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h,
     else:
         S = ear_dist
 
-    # Продление отрезка ушей до границы маски (максимум 1.5 * |7-8|)
+    # Ширина: отрезок ушей растягивается в обе стороны СРАЗУ, на одну и ту же
+    # величину, пока оба его конца не упрутся в границу маски. Раз концы
+    # уходят синхронно, итоговое удлинение -- большее из двух: тот конец, что
+    # вышел из маски раньше, ждёт второй. Максимум -- 1.5 * |7-8|.
     max_extend = config.CALIBRATION_EAR_EXTEND_COEF * ear_dist
-    left_boundary = _find_mask_boundary_along(mask, ear_l, -e1, max_extend)
-    right_boundary = _find_mask_boundary_along(mask, ear_r, e1, max_extend)
-    head_width = float(np.linalg.norm(right_boundary - left_boundary))
+    ext_l = float(np.linalg.norm(
+        _find_mask_boundary_along(mask, ear_l, -e1, max_extend) - ear_l))
+    ext_r = float(np.linalg.norm(
+        _find_mask_boundary_along(mask, ear_r, e1, max_extend) - ear_r))
+    ear_extend = max(ext_l, ext_r)
+    left_boundary = ear_l - ear_extend * e1
+    right_boundary = ear_r + ear_extend * e1
+
+    # Запоминаем расстояния ОТ НОСА до каждого конца -- как len_XN у макушки.
+    # Нос на линии ушей обычно не посередине (голова повёрнута), поэтому
+    # стороны хранятся отдельно, а не одной шириной.
+    right_dist = float(np.dot(right_boundary - nose, e1))
+    left_dist = float(np.dot(nose - left_boundary, e1))
+    head_width = right_dist + left_dist
 
     # Идём от носа вверх (вдоль e2) до границы маски -> макушка
     step = 1.0
@@ -359,7 +375,7 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h,
         neck_fit = None
         if config.CALIBRATION_NECK_FIT_ENABLED and torso_quad is not None:
             neck_fit = _fit_down_dist_by_neck_iou(
-                mask, nose, e1, e2, head_width, len_XN,
+                mask, nose, e1, e2, right_dist, left_dist, len_XN,
                 np.asarray(torso_quad, dtype=np.float64))
             if neck_fit is not None:
                 down_dist = float(neck_fit[0])
@@ -370,7 +386,8 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h,
 
     # Прямоугольник головы (несимметричный относительно носа).
     # Та же сборка, что и в переборе _fit_down_dist_by_neck_iou -- один источник.
-    corners = _head_corners(nose, e1, e2, head_width, len_XN, down_dist)
+    corners = _head_corners(nose, e1, e2, right_dist, left_dist,
+                            len_XN, down_dist)
 
     return {
         'center': nose,
@@ -385,10 +402,160 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h,
         'neck_fit': neck_fit,
         'left_boundary': left_boundary,
         'right_boundary': right_boundary,
+        # Ширина хранится двумя расстояниями от носа, как up/down по вертикали
+        'right_dist': right_dist,
+        'left_dist': left_dist,
+        'ear_extend': ear_extend,
         'k_hw': head_width / S if S > 1e-6 else 0.45,
         'k_hh': head_height / S if S > 1e-6 else 0.60,
         'S': S,
     }
+
+# ------------------------------------------------------------------
+# Калибровка ширины конечностей
+# ------------------------------------------------------------------
+# Отрезки, для которых ширина подбирается по маске. Бёдра 23-25 и 24-26 сюда
+# не входят: их фигуры строятся от вершин торса (build_thigh_quads).
+_WIDTH_PAIRS = ARM_PAIRS + SHIN_PAIRS
+
+# Зеркальные пары точек: (левая, правая). Человек симметричен, а замер по
+# маске -- нет: одна рука может быть прижата к телу, вторая на свету.
+_MIRROR_POINTS = ((11, 12), (13, 14), (15, 16), (25, 26), (27, 28))
+
+
+def _point_cap(idx):
+    """Номинальная ширина точки: минимум по отрезкам, которым она принадлежит.
+
+    Для локтей 13/14 это минимум из плеча и предплечья -- ровно то, чем
+    ограничен их K после взятия минимума двух замеров.
+    """
+    caps = [config.STICKMAN_LIMB_COEFS[p] for p in _WIDTH_PAIRS if idx in p]
+    return min(caps) if caps else None
+
+
+def _limb_width_at(mask, P, u, cap, scale):
+    """Коэффициент ширины в точке P для отрезка с направлением u.
+
+    Из P пускаются два луча перпендикулярно отрезку -- в обе стороны, до
+    границы маски. A и B -- их длины в долях scale. Луч считается коротким,
+    пока он меньше порога: половины номинальной ширины cap с запасом
+    LIMB_EXTEND_COEF.
+
+        оба коротких        K = A + B          -- меряем конечность как есть
+        короткий только B   K = (B + cap) / 2  -- усредняем замер с номиналом
+        короткий только A   K = (A + cap) / 2
+        оба длинных         K = cap            -- замер ничего не говорит
+
+    Длинный луч означает, что он ушёл за пределы самой конечности (в торс или
+    вдоль неё), поэтому в смешанном случае берётся среднее короткого замера и
+    номинала. Формула симметрична по A и B, так что какой из лучей считать
+    «наружным», роли не играет.
+
+    Ветка A + B ограничена сверху не cap, а cap * (1 + LIMB_EXTEND_COEF):
+    если конечность на кадре толще номинала, замер это покажет.
+
+    Если оба луча выродились (точка вне маски -- обычное дело для кистей и
+    стоп, которые сегментация теряет), возвращается cap: номинальная
+    конечность лучше, чем схлопнутая в линию.
+    """
+    n = _rotate90(u)
+    max_dist = config.CALIBRATION_LIMB_RAY_COEF * scale
+    A = float(np.linalg.norm(_find_mask_boundary_along(mask, P, n, max_dist) - P))
+    B = float(np.linalg.norm(_find_mask_boundary_along(mask, P, -n, max_dist) - P))
+    A /= scale
+    B /= scale
+    if A + B < config.CALIBRATION_LIMB_WIDTH_MIN_COEF:
+        return cap
+    thr = cap / 2.0 * (1.0 + config.LIMB_EXTEND_COEF)
+    short_a, short_b = A < thr, B < thr
+    if short_a and short_b:
+        return A + B
+    if short_b:
+        return (B + cap) / 2.0
+    if short_a:
+        return (A + cap) / 2.0
+    return cap
+
+
+def calibrate_limb_widths(mask, pose_landmarks, region, frame_w, frame_h):
+    """Коэффициенты ширины конечностей по точкам: {индекс точки: K}.
+
+    Замер идёт по каждому отрезку из _WIDTH_PAIRS, для обоих его концов.
+    Локти 13/14 входят сразу в два отрезка (плечо и предплечье) -- для них
+    берётся МИНИМУМ двух замеров, чтобы локоть не вылез за тело ни в одном из
+    двух четырёхугольников. Откат на STICKMAN_LIMB_COEFS при вырожденном
+    замере делается внутри _limb_width_at, то есть до взятия минимума.
+
+    Последним шагом левая и правая стороны сводятся к общему значению
+    (_mirror_limb_widths).
+
+    Единицы те же, что у STICKMAN_LIMB_COEFS: доли ширины плеч для рук, доли
+    ширины таза для ног. Точки, которых не видно, в результат не попадают.
+    """
+    def point(idx):
+        return _get_point_px(pose_landmarks, idx, region, frame_w, frame_h)
+
+    sh_l, sh_r = point(LEFT_SHOULDER), point(RIGHT_SHOULDER)
+    if sh_l is None or sh_r is None:
+        return {}
+    S = float(np.linalg.norm(sh_r - sh_l))
+    if S < 1e-6:
+        return {}
+
+    hip_l, hip_r = point(LEFT_HIP), point(RIGHT_HIP)
+    S_hip = S
+    if hip_l is not None and hip_r is not None:
+        d_hip = float(np.linalg.norm(hip_r - hip_l))
+        if d_hip > 1e-6:
+            S_hip = d_hip
+
+    widths = {}
+    for pair in _WIDTH_PAIRS:
+        cap = config.STICKMAN_LIMB_COEFS.get(pair)
+        if cap is None:
+            continue
+        A, B = point(pair[0]), point(pair[1])
+        if A is None or B is None:
+            continue
+        length = float(np.linalg.norm(B - A))
+        if length < 1e-6:
+            continue
+        u = (B - A) / length
+        scale = limb_scale(pair, S, S_hip)
+        for idx, P in ((pair[0], A), (pair[1], B)):
+            k = _limb_width_at(mask, P, u, cap, scale)
+            prev = widths.get(idx)
+            widths[idx] = k if prev is None else min(prev, k)
+    return _mirror_limb_widths(widths)
+
+
+def _mirror_limb_widths(widths):
+    """Сводит левую и правую сторону к общему значению.
+
+    K, в точности равный номиналу, означает, что замер ничего не дал: оба
+    луча ушли за пределы конечности либо точка вообще вне маски. Тогда
+    берётся значение зеркальной точки -- у симметричного человека это
+    осмысленнее номинала. Если замерились обе стороны, берётся среднее.
+    Если обе оказались номинальными, среднее брать не из чего -- обе
+    остаются номинальными.
+
+    Пара, у которой одна из точек не видна, не трогается: подставлять
+    ширину для отсутствующей точки нечего, фигуры для неё всё равно нет.
+    """
+    for left, right in _MIRROR_POINTS:
+        kl, kr = widths.get(left), widths.get(right)
+        if kl is None or kr is None:
+            continue
+        if kl == _point_cap(left):
+            widths[left] = kr
+        elif kr == _point_cap(right):
+            widths[right] = kl
+        else:
+            a = (kl + kr) / 2.0
+            widths[left] = a
+            widths[right] = a
+    return widths
+
 
 # ------------------------------------------------------------------
 # Калибровка торса
@@ -683,12 +850,14 @@ def build_torso_quad_from_params(params, sh_l, sh_r):
 
 
 def save_calibration_params(filepath, head_result, torso_result,
+                            limb_widths=None,
                             video_path=None, frame_index=None):
     """Сохраняет параметры калибровки в JSON для последующего отслеживания.
 
     head_result, torso_result - результаты calibrate_head / calibrate_torso
-    (могут быть None). Сохраняются нормализованные коэффициенты, пригодные
-    для отслеживания на других кадрах.
+    (могут быть None). limb_widths - результат calibrate_limb_widths.
+    Сохраняются нормализованные коэффициенты, пригодные для отслеживания
+    на других кадрах.
     """
     data = {
         'metadata': {
@@ -697,6 +866,10 @@ def save_calibration_params(filepath, head_result, torso_result,
         },
         'head': None,
         'torso': None,
+        # Ширина конечностей по точкам. Ключи JSON -- строки, при чтении
+        # приводятся обратно к int (load_calibration_params).
+        'limbs': ({str(k): float(v) for k, v in limb_widths.items()}
+                  if limb_widths else None),
     }
 
     if head_result is not None:
@@ -705,7 +878,11 @@ def save_calibration_params(filepath, head_result, torso_result,
             'S': float(S),
             'k_hw': float(head_result['k_hw']),
             'k_hh': float(head_result['k_hh']),
+            # width_coef оставлен для старых потребителей: полная ширина.
+            # Форму задают четыре расстояния от носа -- right/left/up/down.
             'width_coef': float(head_result['width'] / S) if S > 1e-6 else 0.0,
+            'right_coef': float(head_result['right_dist'] / S) if S > 1e-6 else 0.0,
+            'left_coef': float(head_result['left_dist'] / S) if S > 1e-6 else 0.0,
             'up_coef': float(head_result['len_XN'] / S) if S > 1e-6 else 0.0,
             'down_coef': float(head_result['down_dist'] / S) if S > 1e-6 else 0.0,
         }
@@ -747,11 +924,18 @@ def save_calibration_params(filepath, head_result, torso_result,
 def load_calibration_params(filepath):
     """Загружает параметры калибровки из JSON.
 
-    Возвращает dict с ключами 'metadata', 'head', 'torso'.
-    'head' и 'torso' могут быть None, если соответствующая часть
-    не была откалибрована.
+    Возвращает dict с ключами 'metadata', 'head', 'torso', 'limbs'.
+    Любая из частей может быть None, если она не была откалибрована; у старых
+    файлов секции 'limbs' нет вовсе -- тогда конечности строятся прежними
+    прямоугольниками.
+
+    Ключи 'limbs' приводятся к int: в JSON они строки, а искать по ним
+    приходится по индексу точки позы.
     """
     with open(filepath, 'r') as f:
         data = json.load(f)
+    limbs = data.get('limbs')
+    if limbs:
+        data['limbs'] = {int(k): float(v) for k, v in limbs.items()}
     print(f"Параметры калибровки загружены: {filepath}")
     return data

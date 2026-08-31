@@ -242,26 +242,48 @@ def _build_torso_poly(landmarks, region, frame_w, frame_h):
     return poly.astype(np.int32)
 
 
-def _build_limb_rect(A, B, width):
-    """Прямоугольник конечности от A до B.
+def _build_limb_quad(A, B, width_a, width_b):
+    """Четырёхугольник конечности от A до B с разной шириной на концах.
 
-    Длинные стороны параллельны A-B, длина = |A-B|, ширина (короткая) = width.
+    В каждой из точек A и B строится отрезок своей длины (width_a / width_b),
+    серединой на самой точке и перпендикулярный A-B; концы отрезков
+    соединяются. При width_a == width_b это обычный прямоугольник.
+
+    Порядок вершин: [B+n, A+n, A-n, B-n]. Он зафиксирован -- по нему
+    LIMB_END_IDX достаёт сторону нужного конца.
     """
     AB = B - A
     length = np.linalg.norm(AB)
     if length < 1e-6:
         return None
-    u = AB / length
-    n = _rotate90(u)
-    mid = (A + B) / 2.0
-    hl, hw = length / 2.0, width / 2.0
+    n = _rotate90(AB / length)
+    ha, hb = width_a / 2.0, width_b / 2.0
     corners = np.array([
-        mid + hl * u + hw * n,
-        mid - hl * u + hw * n,
-        mid - hl * u - hw * n,
-        mid + hl * u - hw * n,
+        B + hb * n,
+        A + ha * n,
+        A - ha * n,
+        B - hb * n,
     ], dtype=np.int32)
     return corners
+
+
+# Вершины четырёхугольника конечности со стороны каждого из концов.
+# Порядок задан в _build_limb_quad: 'A' -- первая точка пары, 'B' -- вторая.
+# Раньше эти вершины отбирались по знаку проекции на ось конечности, но
+# координаты целочисленные, и у почти перпендикулярной кадру конечности
+# округление давало не ровно две вершины -- фигура молча выбрасывалась.
+LIMB_END_IDX = {'A': (1, 2), 'B': (0, 3)}
+
+
+def limb_end_points(quad, end):
+    """Пара вершин четырёхугольника конечности у конца 'A' или 'B'."""
+    q = np.asarray(quad, dtype=np.float64)
+    return [q[i] for i in LIMB_END_IDX[end]]
+
+
+def _build_limb_rect(A, B, width):
+    """Прямоугольник конечности от A до B (одинаковая ширина на концах)."""
+    return _build_limb_quad(A, B, width, width)
 
 
 # Пары точек: руки, ноги, ладони, ступни
@@ -321,6 +343,32 @@ def torso_vertex(torso_quad, name):
 THIGH_TOP_SIDES = {(24, 26): ('BL', LEFT_HIP),    # BL, точка 23
                    (23, 25): ('BR', RIGHT_HIP)}   # BR, точка 24
 LEG_PAIRS = THIGH_PAIRS + SHIN_PAIRS
+
+
+def limb_scale(pair, S, S_hip):
+    """Чем масштабируется отрезок: ноги -- тазом, остальное -- плечами."""
+    return S_hip if pair in LEG_PAIRS else S
+
+
+def limb_widths_px(pair, S, S_hip, limb_widths=None):
+    """Ширина конечности у каждого конца отрезка pair, в пикселях.
+
+    limb_widths -- калиброванные коэффициенты по точкам {индекс: K}. Для точек,
+    которых там нет (или если словаря нет вовсе), берётся постоянная ширина
+    STICKMAN_LIMB_COEFS[pair] -- то есть прежний прямоугольник. Так модель
+    работает и без калибровки, ровно как до появления коэффициентов.
+
+    Возвращает (width_a, width_b) или None, если для отрезка нет коэффициента.
+    """
+    coef = config.STICKMAN_LIMB_COEFS.get(pair)
+    if coef is None:
+        return None
+    scale = limb_scale(pair, S, S_hip)
+    widths = []
+    for idx in pair:
+        k = None if limb_widths is None else limb_widths.get(idx)
+        widths.append((coef if k is None else float(k)) * scale)
+    return widths[0], widths[1]
 # Ладони и ступни: (точка сустава, точки дальнего конца).
 # Если дальних точек несколько -- берётся их середина. Для ладони это середина
 # между указательным (19/20) и мизинцем (17/18), т.е. центр линии костяшек.
@@ -366,13 +414,17 @@ def build_torso_leg_triangles(landmarks, region, frame_w, frame_h, torso_quad):
 
 
 
-def build_thigh_quads(landmarks, region, frame_w, frame_h, torso_quad):
+def build_thigh_quads(landmarks, region, frame_w, frame_h, torso_quad,
+                      limb_widths=None):
     """Четырёхугольники верхней части ног вместо прямоугольников бедра.
 
-    Для отрезка 24-26 (и 23-25) берутся две вершины БЫВШЕГО прямоугольника
-    бедра со стороны колена и верхняя сторона из THIGH_TOP_SIDES: для ноги
-    24-26 это BL и точка 23, для ноги 23-25 -- BR и точка 24. Ширина бывшего
-    прямоугольника считается как раньше: STICKMAN_LIMB_COEFS * ширина таза.
+    Для отрезка 24-26 (и 23-25) берутся две вершины фигуры бедра со стороны
+    колена и верхняя сторона из THIGH_TOP_SIDES: для ноги 24-26 это BL и
+    точка 23, для ноги 23-25 -- BR и точка 24.
+
+    Ширина у бедра -- прежняя (STICKMAN_LIMB_COEFS * ширина таза), а у колена
+    берётся калиброванная K колена, та же, что у верха голени. Иначе на колене
+    оставался бы разрыв контура: бедро 0.676, голень 0.6084.
 
     torso_quad -- четырёхугольник торса [TL, TR, BR, BL]; None -- не строим.
     """
@@ -406,17 +458,13 @@ def build_thigh_quads(landmarks, region, frame_w, frame_h, torso_quad):
         coef = config.STICKMAN_LIMB_COEFS.get((hip_idx, knee_idx))
         if coef is None:
             continue
-        rect = _build_limb_rect(A, B, coef * scale)
+        # У бедра ширина прежняя, у колена -- калиброванная (общая с голенью).
+        k_knee = None if limb_widths is None else limb_widths.get(knee_idx)
+        w_knee = coef if k_knee is None else float(k_knee)
+        rect = _build_limb_quad(A, B, coef * scale, w_knee * scale)
         if rect is None:
             continue
-        AB = B - A
-        u = AB / np.linalg.norm(AB)
-        mid = (A + B) / 2.0
-        # вершины со стороны колена -- те, чья проекция на u положительна
-        knee_pts = [p for p in rect.astype(np.float64)
-                    if float(np.dot(p - mid, u)) > 0.0]
-        if len(knee_pts) != 2:
-            continue
+        knee_pts = limb_end_points(rect, 'B')   # 'B' -- конец у колена
         side = THIGH_TOP_SIDES.get((hip_idx, knee_idx))
         if side is None:
             continue
@@ -495,12 +543,16 @@ def _build_extended_rect(A, B, width, extend_coef):
     return _build_limb_rect(A, A + AB * extend_coef, width)
 
 
-def build_body_rects(landmarks, region, frame_w, frame_h):
-    """Строит прямоугольники частей тела в координатах полного кадра.
+def build_body_rects(landmarks, region, frame_w, frame_h, limb_widths=None):
+    """Строит фигуры частей тела в координатах полного кадра.
 
-    Возвращает dict со списками прямоугольников (каждый -- np.array (4, 2)):
-        'arms'  -- 4 прямоугольника рук (ширина из STICKMAN_LIMB_COEFS)
-        'legs'  -- 4 прямоугольника ног (ширина из STICKMAN_LIMB_COEFS)
+    limb_widths -- калиброванные коэффициенты ширины по точкам {индекс: K}.
+    Руки и голени тогда строятся четырёхугольниками, сужающимися к запястью и
+    лодыжке. None -- прежние прямоугольники постоянной ширины.
+
+    Возвращает dict со списками фигур (каждая -- np.array (4, 2)):
+        'arms'  -- 4 фигуры рук (ширина из limb_widths / STICKMAN_LIMB_COEFS)
+        'legs'  -- 2 фигуры голеней (то же)
         'palms' -- 2 ладони: отрезок от запястья (15/16) к середине между
                    указательным и мизинцем (19+17 / 20+18), удлинённый наружу
         'feet'  -- 2 ступни: отрезок 27-31 / 28-32, удлинённый наружу
@@ -535,15 +587,15 @@ def build_body_rects(landmarks, region, frame_w, frame_h):
     rects = {'arms': [], 'legs': [], 'palms': [], 'feet': [],
              'arm_tops_quad': [], 'S': S, 'S_hip': S_hip}
 
-    for pairs, key, scale in ((ARM_PAIRS, 'arms', S), (SHIN_PAIRS, 'legs', S_hip)):
+    for pairs, key in ((ARM_PAIRS, 'arms'), (SHIN_PAIRS, 'legs')):
         for pair in pairs:
-            coef = config.STICKMAN_LIMB_COEFS.get(pair)
-            if coef is None:
+            widths = limb_widths_px(pair, S, S_hip, limb_widths)
+            if widths is None:
                 continue
             A, B = point(pair[0]), point(pair[1])
             if A is None or B is None:
                 continue
-            rect = _build_limb_rect(A, B, coef * scale)
+            rect = _build_limb_quad(A, B, widths[0], widths[1])
             if rect is not None:
                 rects[key].append(rect)
 
@@ -566,7 +618,7 @@ def build_body_rects(landmarks, region, frame_w, frame_h):
                 rects[key].append(rect)
 
     rects['arm_tops_quad'] = build_arm_tops_quad(
-        landmarks, region, frame_w, frame_h)
+        landmarks, region, frame_w, frame_h, limb_widths=limb_widths)
 
     return rects
 
@@ -587,10 +639,10 @@ def _build_palm_square(wrist, side):
 # Сборка модели
 # ------------------------------------------------------------------
 def build_upper_body_hull(landmarks, region, frame_w, frame_h,
-                          head_corners, torso_quad):
+                          head_corners, torso_quad, limb_widths=None):
     """Выпуклый многоугольник XABCDY между верхом рук и головой.
 
-    A, B -- верхняя (плечевая) сторона прямоугольника отрезка 14-12;
+    A, B -- плечевая сторона фигуры отрезка 14-12;
     C, D -- то же для отрезка 13-11;
     X, Y -- пересечения с прямоугольником головы лучей, выпущенных из ВНЕШНИХ
             верхних вершин этих прямоугольников параллельно соответствующей
@@ -631,18 +683,13 @@ def build_upper_body_hull(landmarks, region, frame_w, frame_h,
     pts = []
     for pair in UPPER_ARM_PAIRS:
         A, B = point(pair[0]), point(pair[1])
-        coef = config.STICKMAN_LIMB_COEFS.get(pair)
-        if A is None or B is None or coef is None:
+        widths = limb_widths_px(pair, S, S, limb_widths)
+        if A is None or B is None or widths is None:
             return []
-        rect = _build_limb_rect(A, B, coef * S)
+        rect = _build_limb_quad(A, B, widths[0], widths[1])
         if rect is None:
             return []
-        u = (B - A) / np.linalg.norm(B - A)
-        mid = (A + B) / 2.0
-        top = [q for q in rect.astype(np.float64)
-               if float(np.dot(q - mid, u)) < 0.0]     # вершины со стороны плеча
-        if len(top) != 2:
-            return []
+        top = limb_end_points(rect, 'A')        # 'A' -- конец у плеча
         top.sort(key=lambda q: float(np.linalg.norm(q - head_center)))
         inner, outer = top[0], top[1]
 
@@ -663,11 +710,11 @@ def build_upper_body_hull(landmarks, region, frame_w, frame_h,
     return [hull.reshape(-1, 2).astype(np.int32)]
 
 
-def build_arm_tops_quad(landmarks, region, frame_w, frame_h):
-    """Четырёхугольник ABCD по верхним (плечевым) сторонам прямоугольников рук.
+def build_arm_tops_quad(landmarks, region, frame_w, frame_h, limb_widths=None):
+    """Четырёхугольник ABCD по плечевым сторонам фигур рук.
 
-    A, B -- верхняя сторона прямоугольника отрезка 14-12;
-    C, D -- верхняя сторона прямоугольника отрезка 13-11.
+    A, B -- плечевая сторона фигуры отрезка 14-12;
+    C, D -- плечевая сторона фигуры отрезка 13-11.
 
     В отличие от build_upper_body_hull, ни голова, ни торс не нужны -- нужны
     только точки позы. Порядок вершин задаётся выпуклой оболочкой, чтобы
@@ -688,27 +735,24 @@ def build_arm_tops_quad(landmarks, region, frame_w, frame_h):
     pts = []
     for pair in UPPER_ARM_PAIRS:
         A, B = point(pair[0]), point(pair[1])
-        coef = config.STICKMAN_LIMB_COEFS.get(pair)
-        if A is None or B is None or coef is None:
+        widths = limb_widths_px(pair, S, S, limb_widths)
+        if A is None or B is None or widths is None:
             return []
-        rect = _build_limb_rect(A, B, coef * S)
+        rect = _build_limb_quad(A, B, widths[0], widths[1])
         if rect is None:
             return []
-        u = (B - A) / np.linalg.norm(B - A)
-        mid = (A + B) / 2.0
-        top = [q for q in rect.astype(np.float64)
-               if float(np.dot(q - mid, u)) < 0.0]     # вершины со стороны плеча
-        if len(top) != 2:
-            return []
-        pts.extend(top)
+        pts.extend(limb_end_points(rect, 'A'))   # 'A' -- конец у плеча
 
     hull = cv2.convexHull(np.asarray(pts, dtype=np.float32))
     return [hull.reshape(-1, 2).astype(np.int32)]
 
 
 def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
-                        torso_quad=None, head_corners=None):
+                        torso_quad=None, head_corners=None, limb_widths=None):
     """Строит бинарную маску модели тела (uint8, 0/255) в координатах полного кадра.
+
+    limb_widths -- калиброванные коэффициенты ширины по точкам {индекс: K}.
+    None -- конечности строятся прямоугольниками постоянной ширины, как раньше.
 
     torso_quad -- четырёхугольник торса [TL, TR, BR, BL] из калибровки.
     Нужен только для треугольников торс-нога (24-26-BL, 23-25-BR): свой торс
@@ -763,15 +807,18 @@ def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
         if d_hip > 1e-6:
             S_hip = d_hip
 
-    for (a, b), coef in config.STICKMAN_LIMB_COEFS.items():
+    for pair in config.STICKMAN_LIMB_COEFS:
+        a, b = pair
         A = _get_point_px(landmarks, a, region, frame_w, frame_h)
         B = _get_point_px(landmarks, b, region, frame_w, frame_h)
         if A is None or B is None:
             continue
-        if (a, b) in THIGH_PAIRS:
+        if pair in THIGH_PAIRS:
             continue          # верх ноги закрывается четырёхугольником, п.7
-        scale = S_hip if (a, b) in LEG_PAIRS else S
-        rect = _build_limb_rect(A, B, coef * scale)
+        widths = limb_widths_px(pair, S, S_hip, limb_widths)
+        if widths is None:
+            continue
+        rect = _build_limb_quad(A, B, widths[0], widths[1])
         if rect is not None:
             cv2.fillPoly(mask, [rect], 255)
 
@@ -785,13 +832,15 @@ def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
         cv2.fillPoly(mask, [square], 255)
 
     # 6. Верх ног: четырёхугольники BL/BR + вершины у колена (нужен торс)
-    for q in build_thigh_quads(landmarks, region, frame_w, frame_h, torso_quad):
+    for q in build_thigh_quads(landmarks, region, frame_w, frame_h, torso_quad,
+                               limb_widths=limb_widths):
         cv2.fillPoly(mask, [q], 255)
 
-    # 7. Четырёхугольник ABCD по верхним сторонам прямоугольников рук.
+    # 7. Четырёхугольник ABCD по плечевым сторонам фигур рук.
     # ВРЕМЕННО вместо многоугольника XABCDY (build_upper_body_hull): чтобы
     # вернуть его, замените вызов ниже -- сама функция сохранена.
-    for q in build_arm_tops_quad(landmarks, region, frame_w, frame_h):
+    for q in build_arm_tops_quad(landmarks, region, frame_w, frame_h,
+                                 limb_widths=limb_widths):
         cv2.fillPoly(mask, [q], 255)
 
     return mask

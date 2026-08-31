@@ -109,6 +109,10 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
             print("    Запустите calibrate_stickman.py для создания параметров.")
             calib_params = None
 
+    # Ширина конечностей по точкам. У старых калибровок секции нет -- тогда
+    # конечности строятся прежними прямоугольниками постоянной ширины.
+    calib_limb_widths = calib_params.get('limbs') if calib_params else None
+
     n_mediapipe = sum(x is not None for x in (segmenter, pose_landmarker, face_landmarker))
     n_active = n_mediapipe + (1 if use_yolo_crop else 0)
 
@@ -324,7 +328,8 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                 stickman_mask = build_stickman_mask(
                     pose_result.pose_landmarks, region, width, height,
                     torso_quad=tracked_torso_quad,
-                    head_corners=tracked_head_corners)
+                    head_corners=tracked_head_corners,
+                    limb_widths=calib_limb_widths)
                 if stickman_mask is not None:
                     overlay = overlay_stickman(
                         overlay, stickman_mask,
@@ -370,7 +375,8 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                 # для них не нужна (ширина -- доля от плеч / таза).
                 body_rects = None
                 if config.DRAW_TRACKED_PALMS or config.DRAW_TRACKED_FEET:
-                    body_rects = build_body_rects(pose_lm, region, width, height)
+                    body_rects = build_body_rects(pose_lm, region, width, height,
+                                                  limb_widths=calib_limb_widths)
                 if body_rects is not None:
                     tracked_extra = []
                     if config.DRAW_TRACKED_PALMS:

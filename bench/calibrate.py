@@ -36,7 +36,8 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 from . import config
-from .calibration import calibrate_head, calibrate_torso, save_calibration_params
+from .calibration import (calibrate_head, calibrate_torso,
+                          calibrate_limb_widths, save_calibration_params)
 from .download import ensure_models
 from .stickman_model import build_body_rects, build_thigh_quads
 from .tracking import build_neck_quad_from_torso_and_head
@@ -54,6 +55,79 @@ _RECT_GROUPS = (
     ('thigh_quads', 'четыр. бёдер', 'CALIB_THIGH_QUAD_COLOR'),
     ('arm_tops_quad', 'четыр. ABCD', 'CALIB_ARM_TOPS_COLOR'),
 )
+
+
+def detect_chin(face_landmarker, image_bgr, origin):
+    """Подбородок (точка 152) на изображении, в координатах полного кадра.
+
+    origin -- смещение левого верхнего угла image_bgr в полном кадре.
+    Возвращает None, если лицо не найдено или овал лица неполон: без овала
+    точки подбородка попросту нет.
+    """
+    if image_bgr is None or image_bgr.size == 0:
+        return None
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    res = face_landmarker.detect(
+        mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    if not res.face_landmarks:
+        return None
+    lm = res.face_landmarks[0]
+    need = max(max(config.FACE_OVAL), config.CALIB_FACE_CHIN_INDEX)
+    if len(lm) <= need:
+        return None
+    h, w = image_bgr.shape[:2]
+    chin = lm[config.CALIB_FACE_CHIN_INDEX]
+    return np.array([chin.x * w + origin[0], chin.y * h + origin[1]],
+                    dtype=np.float64)
+
+
+def head_crop_box(corners, frame_w, frame_h, expand):
+    """Прямоугольник кропа вокруг квадрата головы, увеличенный в expand раз.
+
+    Квадрат головы повёрнут (стороны вдоль линии ушей), а кроп детектору
+    нужен по осям кадра, поэтому берётся описанный прямоугольник и
+    растягивается от своего центра.
+
+    Возвращает (x0, y0, x1, y1) в координатах полного кадра либо None.
+    """
+    pts = np.asarray(corners, dtype=np.float64)
+    if pts.shape[0] < 3:
+        return None
+    x0, x1 = float(pts[:, 0].min()), float(pts[:, 0].max())
+    y0, y1 = float(pts[:, 1].min()), float(pts[:, 1].max())
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    hw, hh = (x1 - x0) / 2.0 * expand, (y1 - y0) / 2.0 * expand
+    bx0 = max(0, int(round(cx - hw)))
+    by0 = max(0, int(round(cy - hh)))
+    bx1 = min(frame_w, int(round(cx + hw)))
+    by1 = min(frame_h, int(round(cy + hh)))
+    if bx1 - bx0 < 2 or by1 - by0 < 2:
+        return None
+    return bx0, by0, bx1, by1
+
+
+# Подписи точек, для которых калибруется ширина конечности.
+_WIDTH_POINT_LABELS = (
+    (11, 'плечо L'), (13, 'локоть L'), (15, 'запястье L'),
+    (12, 'плечо R'), (14, 'локоть R'), (16, 'запястье R'),
+    (25, 'колено L'), (27, 'лодыжка L'),
+    (26, 'колено R'), (28, 'лодыжка R'),
+)
+
+
+def print_limb_widths(limb_widths):
+    """Печатает калиброванные коэффициенты ширины по точкам."""
+    if not limb_widths:
+        print("\nШирина конечностей: не откалибрована "
+              "(точки не видны) -- прежние прямоугольники")
+        return
+    print("\nШирина конечностей (доли плеч для рук, таза для ног):")
+    for idx, label in _WIDTH_POINT_LABELS:
+        k = limb_widths.get(idx)
+        if k is None:
+            print(f"  {idx:>2} {label:<10} --")
+        else:
+            print(f"  {idx:>2} {label:<10} {k:.4f}")
 
 
 def draw_body_rects(overlay, body_rects):
@@ -217,24 +291,16 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     pose_landmarks = pose_result.pose_landmarks[0]
     print("Поза обнаружена")
 
-    # Face на кропе -> подбородок
+    # Face на кропе -> подбородок. Детектор закрываем не здесь: если лицо на
+    # кропе человека не нашлось, он ещё понадобится для повторной попытки на
+    # тесном кропе головы (после калибровки головы).
     print("Загрузка face_landmarker...")
     face_landmarker = create_face_landmarker(face_path)
-    face_result = face_landmarker.detect(mp_image)
-    face_landmarker.close()
-    chin_point = None
-    if face_result.face_landmarks:
-        face_lm = face_result.face_landmarks[0]
-        if len(face_lm) > config.CALIB_FACE_CHIN_INDEX:
-            chin_lm = face_lm[config.CALIB_FACE_CHIN_INDEX]
-            # Координаты кропа -> координаты полного кадра
-            chin_point = np.array([chin_lm.x * crop_w + x1_c,
-                                   chin_lm.y * crop_h + y1_c], dtype=np.float64)
-            print(f"Подбородок найден: ({chin_point[0]:.1f}, {chin_point[1]:.1f})")
-        else:
-            print("Подбородок: точка недоступна")
+    chin_point = detect_chin(face_landmarker, crop, (x1_c, y1_c))
+    if chin_point is not None:
+        print(f"Подбородок найден: ({chin_point[0]:.1f}, {chin_point[1]:.1f})")
     else:
-        print("Лицо не обнаружено (подбородок не используется)")
+        print("Лицо на кропе человека не обнаружено")
 
     # Калибровка (точки позы -- в координатах кропа, маска -- полного кадра)
     region = (x1_c, y1_c, crop_w, crop_h)
@@ -242,9 +308,16 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     print("РЕЗУЛЬТАТЫ КАЛИБРОВКИ")
     print("=" * 50)
 
-    # Прямоугольники частей тела считаем ДО калибровки торса: руки и ладони
-    # служат барьером для вытягивания нижних вершин торса (BL, BR).
-    body_rects = build_body_rects(pose_landmarks, region, frame_w, frame_h)
+    # Ширина конечностей замеряется по маске ПЕРВОЙ: от неё зависят фигуры
+    # рук, а те служат барьером при калибровке торса.
+    limb_widths = calibrate_limb_widths(mask_full, pose_landmarks, region,
+                                        frame_w, frame_h)
+    print_limb_widths(limb_widths)
+
+    # Фигуры частей тела считаем ДО калибровки торса: руки и ладони служат
+    # барьером для вытягивания нижних вершин торса (BL, BR).
+    body_rects = build_body_rects(pose_landmarks, region, frame_w, frame_h,
+                                  limb_widths=limb_widths)
     barrier_rects = None
     if body_rects is not None:
         barrier_rects = body_rects['arms'] + body_rects['palms']
@@ -258,19 +331,51 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     if body_rects is not None:
         body_rects['thigh_quads'] = build_thigh_quads(
             pose_landmarks, region, frame_w, frame_h,
-            torso_result['quad'] if torso_result is not None else None)
+            torso_result['quad'] if torso_result is not None else None,
+            limb_widths=limb_widths)
 
     # Голова считается ПОСЛЕ торса: при отсутствии подбородка нижняя граница
     # головы подбирается по тому, как фигура (голова + шея) ложится на маску,
     # а шея строится из верхнего ребра торса.
+    torso_quad = torso_result['quad'] if torso_result is not None else None
     head_result = calibrate_head(mask_full, pose_landmarks, region,
                                  frame_w, frame_h, chin_point=chin_point,
-                                 torso_quad=(torso_result['quad']
-                                             if torso_result is not None else None))
+                                 torso_quad=torso_quad)
+
+    # Лицо не нашлось на кропе всего человека -- голова там занимает малую
+    # часть картинки. Пробуем ещё раз на тесном кропе вокруг уже построенного
+    # квадрата головы, увеличенном на CALIB_HEAD_CROP_EXPAND. Если овал лица
+    # там детектится, подбородок известен и голова пересчитывается по нему.
+    if chin_point is None and head_result is not None:
+        box = head_crop_box(head_result['corners'], frame_w, frame_h,
+                            config.CALIB_HEAD_CROP_EXPAND)
+        if box is None:
+            print("Повторный поиск лица: кроп головы вырожден")
+        else:
+            bx0, by0, bx1, by1 = box
+            print(f"Повторный поиск лица на кропе головы "
+                  f"{bx1 - bx0}x{by1 - by0} (+{(config.CALIB_HEAD_CROP_EXPAND - 1) * 100:.0f}%)...")
+            chin_point = detect_chin(face_landmarker,
+                                     frame_bgr[by0:by1, bx0:bx1], (bx0, by0))
+            if chin_point is None:
+                print("  лицо не обнаружено -- нижняя граница остаётся по IoU шеи")
+            else:
+                print(f"  подбородок найден: ({chin_point[0]:.1f}, "
+                      f"{chin_point[1]:.1f}) -- пересчитываем голову")
+                head_result = calibrate_head(mask_full, pose_landmarks, region,
+                                             frame_w, frame_h,
+                                             chin_point=chin_point,
+                                             torso_quad=torso_quad)
+
+    face_landmarker.close()
 
     if head_result is not None:
         print("\nГолова:")
-        print(f"  Ширина (продление ушей): {head_result['width']:.1f} px")
+        print(f"  Ширина (продление ушей): {head_result['width']:.1f} px "
+              f"(удлинение отрезка ушей {head_result['ear_extend']:.1f} px "
+              f"в каждую сторону)")
+        print(f"  От носа вправо/влево:    {head_result['right_dist']:.1f} / "
+              f"{head_result['left_dist']:.1f} px")
         print(f"  Высота:                  {head_result['height']:.1f} px")
         print(f"  len(XN) вверх:           {head_result['len_XN']:.1f} px")
         src = head_result['down_source']
@@ -342,6 +447,7 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     # Сохранение параметров калибровки в JSON
     os.makedirs(os.path.dirname(os.path.abspath(params_path)) or ".", exist_ok=True)
     save_calibration_params(params_path, head_result, torso_result,
+                            limb_widths=limb_widths,
                             video_path=video_path, frame_index=frame_index)
 
     # Визуализация на полном кадре

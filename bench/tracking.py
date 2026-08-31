@@ -52,17 +52,23 @@ def build_head_rect_from_params(params, pose_landmarks, region, frame_w, frame_h
         # Плечи не видны - используем расстояние между ушами как масштаб
         S_cur = ear_dist
 
-    # Размеры головы из параметров калибровки (масштабированные на текущую ширину плеч)
-    width = params['width_coef'] * S_cur
+    # Размеры головы из параметров калибровки (масштабированные на текущую
+    # ширину плеч). Ширина задана двумя расстояниями от носа: нос на линии
+    # ушей обычно не посередине. У старых калибровок этих ключей нет -- там
+    # берётся прежняя половина общей ширины на обе стороны.
     up = params['up_coef'] * S_cur
     down = params['down_coef'] * S_cur
+    if 'right_coef' in params and 'left_coef' in params:
+        right = params['right_coef'] * S_cur
+        left = params['left_coef'] * S_cur
+    else:
+        right = left = params['width_coef'] * S_cur / 2.0
 
-    hw = width / 2.0
     corners = np.array([
-        nose + hw * e1 + up * e2,      # верхний правый
-        nose - hw * e1 + up * e2,      # верхний левый
-        nose - hw * e1 - down * e2,    # нижний левый
-        nose + hw * e1 - down * e2,    # нижний правый
+        nose + right * e1 + up * e2,      # верхний правый
+        nose - left * e1 + up * e2,       # верхний левый
+        nose - left * e1 - down * e2,     # нижний левый
+        nose + right * e1 - down * e2,    # нижний правый
     ], dtype=np.float64)
     return corners
 
