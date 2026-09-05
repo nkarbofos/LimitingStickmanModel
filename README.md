@@ -120,7 +120,7 @@ pip install -e ".[calib]"        # + калибровка (тянет torch, ~2 
 ## Быстрый старт
 
 ```bash
-# наложить модель на демо-видео -> output/example_tracked.mp4
+# наложить модель на демо-видео -> output/example_out.mp4
 python track_stickman.py
 
 # то же самое, но без сегментатора: он не участвует в построении модели
@@ -146,7 +146,7 @@ python track_stickman.py     --video my.mp4 --output out.mp4
 
 | Файл | Чем создаётся |
 |---|---|
-| `output/example_tracked.mp4` | `track_stickman.py` |
+| `output/example_out.mp4` | `track_stickman.py` |
 | `output/calibration_params.json` | `calibrate_stickman.py` |
 | `output/calibration_result.png` | `calibrate_stickman.py` |
 

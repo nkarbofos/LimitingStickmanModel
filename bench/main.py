@@ -23,7 +23,9 @@ from .download import ensure_models
 from .stickman_model import (build_stickman_mask, overlay_stickman,
                              build_body_rects)
 from .calibration import load_calibration_params
-from .tracking import build_head_rect_from_params, build_torso_quad_from_params, build_neck_quad_from_torso_and_head
+from .tracking import (build_head_rect_from_params, build_torso_quad_from_params,
+                       build_neck_quad_from_torso_and_head,
+                       build_shoulders_bottom_quads, build_lower_neck_quad)
 from .stickman_model import LEFT_SHOULDER, RIGHT_SHOULDER, _get_point_px
 from .calibration import LEFT_HIP, RIGHT_HIP
 
@@ -112,6 +114,8 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
     # Ширина конечностей по точкам. У старых калибровок секции нет -- тогда
     # конечности строятся прежними прямоугольниками постоянной ширины.
     calib_limb_widths = calib_params.get('limbs') if calib_params else None
+    # Профиль шеи. У старых калибровок секции нет -- шея строится трапецией.
+    calib_neck = calib_params.get('neck') if calib_params else None
 
     n_mediapipe = sum(x is not None for x in (segmenter, pose_landmarker, face_landmarker))
     n_active = n_mediapipe + (1 if use_yolo_crop else 0)
@@ -321,7 +325,34 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                     tracked_torso_quad = build_torso_quad_from_params(
                         calib_params['torso'], _sh_l, _sh_r,
                         hip_l=_get_point_px(_lm, LEFT_HIP, region, width, height),
-                        hip_r=_get_point_px(_lm, RIGHT_HIP, region, width, height))
+                        hip_r=_get_point_px(_lm, RIGHT_HIP, region, width, height),
+                        frame_h=height)
+
+            # Шея: нужна и маске stickman, и блоку отслеживания ниже.
+            tracked_neck_quad = None
+            if tracked_head_corners is not None and tracked_torso_quad is not None:
+                tracked_neck_quad = build_neck_quad_from_torso_and_head(
+                    tracked_torso_quad, tracked_head_corners, calib_neck)
+
+            # Фигуры "плечи-низ": есть только у калибровок с половинного
+            # кадра без бёдер (целиком либо половинками по невидимой руке).
+            tracked_shoulders_bottom = []
+            if calib_params is not None and calib_params.get('torso') is not None \
+                    and pose_result is not None and pose_result.pose_landmarks:
+                _lm = pose_result.pose_landmarks[0]
+                tracked_shoulders_bottom = build_shoulders_bottom_quads(
+                    calib_params['torso'], tracked_torso_quad,
+                    _get_point_px(_lm, LEFT_SHOULDER, region, width, height),
+                    _get_point_px(_lm, RIGHT_SHOULDER, region, width, height),
+                    width, height)
+
+            # Шея во весь низ кадра: плечи не видны, торса нет.
+            tracked_lower_neck = None
+            if calib_params is not None and calib_params.get('lower_neck') is not None \
+                    and tracked_torso_quad is None:
+                tracked_lower_neck = build_lower_neck_quad(
+                    calib_params['lower_neck'], tracked_head_corners,
+                    width, height)
 
             # --- Модель stickman (поверх тепловой карты, под скелетом) ---
             if config.DRAW_STICKMAN and pose_result is not None and pose_result.pose_landmarks:
@@ -329,7 +360,11 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                     pose_result.pose_landmarks, region, width, height,
                     torso_quad=tracked_torso_quad,
                     head_corners=tracked_head_corners,
-                    limb_widths=calib_limb_widths)
+                    limb_widths=calib_limb_widths,
+                    neck_quad=tracked_neck_quad,
+                    shoulders_bottom_quads=tracked_shoulders_bottom,
+                    lower_neck_quad=tracked_lower_neck,
+                    limb_grow=(calib_params or {}).get('limb_grow'))
                 if stickman_mask is not None:
                     overlay = overlay_stickman(
                         overlay, stickman_mask,
@@ -355,62 +390,46 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                 # Торс -- посчитан выше (нужен был маске stickman)
                 torso_quad = tracked_torso_quad
 
-                # Шея (из торса и головы)
-                neck_quad = None
-                if head_corners is not None and torso_quad is not None:
-                    neck_quad = build_neck_quad_from_torso_and_head(torso_quad, head_corners)
+                # Шея -- посчитана выше (нужна была маске stickman)
+                neck_quad = tracked_neck_quad
 
-                # Заполнение фигур (в порядке: торс, шея, голова)
-                if torso_quad is not None:
-                    overlay = fill_poly_with_alpha(overlay, torso_quad,
-                                                   config.STICKMAN_COLOR, config.STICKMAN_ALPHA)
-                if neck_quad is not None:
-                    overlay = fill_poly_with_alpha(overlay, neck_quad,
-                                                   config.STICKMAN_COLOR, config.STICKMAN_ALPHA)
-                if head_corners is not None:
-                    overlay = fill_poly_with_alpha(overlay, head_corners,
-                                                   config.STICKMAN_COLOR, config.STICKMAN_ALPHA)
+                # Все фигуры ниже уже залиты в маску stickman, поэтому по
+                # умолчанию не рисуются: заливка легла бы вторым слоем поверх
+                # маски, а контуры дублировали бы её границу. Каждый флаг
+                # DRAW_TRACKED_* включает свою фигуру обратно -- заливку и
+                # контур сразу.
+                for enabled, poly, color in (
+                        (config.DRAW_TRACKED_TORSO, torso_quad, config.TRACKED_TORSO_COLOR),
+                        (config.DRAW_TRACKED_NECK, neck_quad, config.TRACKED_NECK_COLOR),
+                        (config.DRAW_TRACKED_HEAD, head_corners, config.TRACKED_HEAD_COLOR)):
+                    if not enabled or poly is None:
+                        continue
+                    overlay = fill_poly_with_alpha(overlay, poly,
+                                                   config.STICKMAN_COLOR,
+                                                   config.STICKMAN_ALPHA)
+                    cv2.polylines(overlay, [np.asarray(poly, dtype=np.int32)],
+                                  isClosed=True, color=color,
+                                  thickness=config.TRACKED_THICKNESS)
 
                 # Ладони и ступни: строятся прямо из точек позы, калибровка
                 # для них не нужна (ширина -- доля от плеч / таза).
-                body_rects = None
                 if config.DRAW_TRACKED_PALMS or config.DRAW_TRACKED_FEET:
                     body_rects = build_body_rects(pose_lm, region, width, height,
                                                   limb_widths=calib_limb_widths)
-                if body_rects is not None:
                     tracked_extra = []
-                    if config.DRAW_TRACKED_PALMS:
-                        tracked_extra.append((body_rects['palms'], config.TRACKED_PALM_COLOR))
-                    if config.DRAW_TRACKED_FEET:
-                        tracked_extra.append((body_rects['feet'], config.TRACKED_FOOT_COLOR))
-                    for rects_group, _color in tracked_extra:
+                    if body_rects is not None:
+                        if config.DRAW_TRACKED_PALMS:
+                            tracked_extra.append((body_rects['palms'], config.TRACKED_PALM_COLOR))
+                        if config.DRAW_TRACKED_FEET:
+                            tracked_extra.append((body_rects['feet'], config.TRACKED_FOOT_COLOR))
+                    for rects_group, color in tracked_extra:
                         for rect in rects_group:
                             overlay = fill_poly_with_alpha(
                                 overlay, np.asarray(rect, dtype=np.float64),
                                 config.STICKMAN_COLOR, config.STICKMAN_ALPHA)
-
-                # Контуры фигур (поверх заполнения)
-                if body_rects is not None:
-                    for rects_group, color in tracked_extra:
-                        for rect in rects_group:
                             cv2.polylines(overlay, [np.asarray(rect, dtype=np.int32)],
                                           isClosed=True, color=color,
                                           thickness=config.TRACKED_THICKNESS)
-                if config.DRAW_TRACKED_TORSO and torso_quad is not None:
-                    cv2.polylines(overlay, [torso_quad.astype(np.int32)],
-                                  isClosed=True,
-                                  color=config.TRACKED_TORSO_COLOR,
-                                  thickness=config.TRACKED_THICKNESS)
-                if config.DRAW_TRACKED_NECK and neck_quad is not None:
-                    cv2.polylines(overlay, [neck_quad.astype(np.int32)],
-                                  isClosed=True,
-                                  color=config.TRACKED_NECK_COLOR,
-                                  thickness=config.TRACKED_THICKNESS)
-                if config.DRAW_TRACKED_HEAD and head_corners is not None:
-                    cv2.polylines(overlay, [head_corners.astype(np.int32)],
-                                  isClosed=True,
-                                  color=config.TRACKED_HEAD_COLOR,
-                                  thickness=config.TRACKED_THICKNESS)
 
             # Прямоугольник YOLO
             if config.DRAW_YOLO_BBOX and region is not None:

@@ -36,6 +36,8 @@ LEFT_KNEE = 25
 RIGHT_KNEE = 26
 LEFT_ANKLE = 27
 RIGHT_ANKLE = 28
+LEFT_HEEL = 29
+RIGHT_HEEL = 30
 LEFT_FOOT_INDEX = 31
 RIGHT_FOOT_INDEX = 32
 
@@ -327,6 +329,40 @@ def polygon_self_intersects(poly):
     return False
 
 
+def clamp_head_down_to_shoulders(nose, e1, e2, right, left, down, sh_l, sh_r):
+    """Урезает down так, чтобы низ головы не ушёл ниже линии плеч 11-12.
+
+    Прямоугольник головы стоит на своих осях (e1 -- вдоль ушей, e2 -- вверх),
+    поэтому проверяются оба нижних угла: nose + right*e1 - down*e2 и
+    nose - left*e1 - down*e2. Оба должны остаться по ту же сторону прямой
+    11-12, что и нос.
+
+    Возвращает исходный down, если плечи не видны, если шаг вниз от плеч не
+    удаляет (вырожденный наклон) или если нос уже сам ниже линии плеч --
+    в последнем случае ограничение невыполнимо, и резать голову в ноль хуже,
+    чем оставить как есть.
+    """
+    if sh_l is None or sh_r is None:
+        return down
+    sh_l = np.asarray(sh_l, dtype=np.float64)
+    sh_r = np.asarray(sh_r, dtype=np.float64)
+    S = float(np.linalg.norm(sh_r - sh_l))
+    if S < 1e-6:
+        return down
+    n = _rotate90((sh_r - sh_l) / S)
+    a = float(np.dot(np.asarray(nose, dtype=np.float64) - (sh_l + sh_r) / 2.0, n))
+    if a < 0:
+        n, a = -n, -a                 # нормаль смотрит от плеч к голове
+    c = float(np.dot(e2, n))          # насколько шаг вниз приближает к плечам
+    if c <= 1e-9:
+        return down
+    d1 = float(np.dot(e1, n))
+    limit = min(a + d1 * right, a - d1 * left) / c
+    if limit <= 0.0:
+        return down
+    return min(down, limit)
+
+
 def torso_vertex(torso_quad, name):
     """Вершина контура торса по имени ('TL', 'TR', 'BR', 'BL', 'ML', 'MR').
 
@@ -350,7 +386,21 @@ def limb_scale(pair, S, S_hip):
     return S_hip if pair in LEG_PAIRS else S
 
 
-def limb_widths_px(pair, S, S_hip, limb_widths=None):
+def limb_grow_px(pair, S, S_hip, limb_grow=None):
+    """Раздвижение фигуры пары по маске, в пикселях НА СТОРОНУ (0 -- нет).
+
+    Коэффициент замерен при калибровке в долях того же масштаба, что и сама
+    ширина (плечи для рук, таз для ног), поэтому переносится на любой кадр.
+    """
+    if not limb_grow:
+        return 0.0
+    coef = limb_grow.get('%d_%d' % pair)
+    if coef is None:
+        return 0.0
+    return float(coef) * limb_scale(pair, S, S_hip)
+
+
+def limb_widths_px(pair, S, S_hip, limb_widths=None, limb_grow=None):
     """Ширина конечности у каждого конца отрезка pair, в пикселях.
 
     limb_widths -- калиброванные коэффициенты по точкам {индекс: K}. Для точек,
@@ -364,10 +414,11 @@ def limb_widths_px(pair, S, S_hip, limb_widths=None):
     if coef is None:
         return None
     scale = limb_scale(pair, S, S_hip)
+    grow = 2.0 * limb_grow_px(pair, S, S_hip, limb_grow)   # на обе стороны
     widths = []
     for idx in pair:
         k = None if limb_widths is None else limb_widths.get(idx)
-        widths.append((coef if k is None else float(k)) * scale)
+        widths.append((coef if k is None else float(k)) * scale + grow)
     return widths[0], widths[1]
 # Ладони и ступни: (точка сустава, точки дальнего конца).
 # Если дальних точек несколько -- берётся их середина. Для ладони это середина
@@ -376,6 +427,11 @@ PALM_SPECS = ((LEFT_WRIST, (LEFT_INDEX, LEFT_PINKY)),
               (RIGHT_WRIST, (RIGHT_INDEX, RIGHT_PINKY)))
 FOOT_SPECS = ((LEFT_ANKLE, (LEFT_FOOT_INDEX,)),
               (RIGHT_ANKLE, (RIGHT_FOOT_INDEX,)))
+
+# Ступня: (пара голени, (лодыжка, пятка, носок)). Голень нужна целиком --
+# её нижняя сторона служит общим основанием обеих фигур ступни.
+FOOT_PARTS = (((LEFT_KNEE, LEFT_ANKLE), (LEFT_ANKLE, LEFT_HEEL, LEFT_FOOT_INDEX)),
+              ((RIGHT_KNEE, RIGHT_ANKLE), (RIGHT_ANKLE, RIGHT_HEEL, RIGHT_FOOT_INDEX)))
 
 # Треугольники таза: (правое бедро, левое бедро, колено). Закрывают область
 # между бёдрами и коленями, которую не покрывают ни торс, ни прямоугольники ног.
@@ -543,7 +599,313 @@ def _build_extended_rect(A, B, width, extend_coef):
     return _build_limb_rect(A, A + AB * extend_coef, width)
 
 
-def build_body_rects(landmarks, region, frame_w, frame_h, limb_widths=None):
+def build_foot_poly(ankle, heel, toe, S_hip, shin_quad):
+    """Фигура ступни: выпуклый пятиугольник, опирающийся на голень.
+
+    ankle, heel, toe -- точки 27/29/31 (или 28/30/32) в координатах кадра.
+    shin_quad -- четырёхугольник голени 25-27 (26-28). Из него берётся сторона
+    у лодыжки (limb_end_points(..., 'B')), поэтому шов с голенью сходится без
+    зазора.
+
+    Основа -- четырёхугольник: отрезок 27-31 продлевается за носок в
+    STICKMAN_FOOT_EXTEND_COEF раз, в конце ставится перпендикулярный ему
+    отрезок с серединой в этой точке, концы отрезка соединяются со стороной
+    голени. Длина отрезка обратно зависит от |27-29|: чем сильнее стопа
+    развёрнута на камеру, тем короче проекция лодыжка-пятка и тем шире видна
+    стопа. Потолок нужен, потому что при |27-29| -> 0 формула расходится.
+
+    Пятая вершина -- пятка. Контур берётся выпуклой оболочкой пяти точек. Если
+    пятка попала внутрь четырёхугольника, оболочка выходит меньше пяти вершин
+    -- выпуклого пятиугольника не существует, и остаётся сам четырёхугольник.
+
+    Возвращает контур (int32) либо None, если данных не хватает -- тогда
+    вызывающий строит прежний прямоугольник.
+    """
+    if shin_quad is None or ankle is None or heel is None or toe is None:
+        return None
+    ankle = np.asarray(ankle, dtype=np.float64)
+    heel = np.asarray(heel, dtype=np.float64)
+    toe = np.asarray(toe, dtype=np.float64)
+    AT = toe - ankle
+    length = float(np.linalg.norm(AT))
+    if length < 1e-6:
+        return None
+    n = _rotate90(AT / length)
+    P = ankle + AT * config.STICKMAN_FOOT_EXTEND_COEF
+
+    cap = config.STICKMAN_FOOT_WIDTH_CAP_COEF * S_hip
+    d_heel = float(np.linalg.norm(heel - ankle))
+    width = cap if d_heel < 1e-6 else min(
+        config.STICKMAN_FOOT_WIDTH_COEF * S_hip / d_heel, cap)
+    half = width / 2.0
+
+    # Сортировка по проекции на нормаль ставит вершины голени и концы отрезка
+    # по одну сторону оси -- обход [e+, P+, P-, e-] не самопересекается, если
+    # пятка внутри и оболочка не пригодилась.
+    ends = sorted(limb_end_points(shin_quad, 'B'),
+                  key=lambda q: float(np.dot(q - ankle, n)))
+    quad = [ends[1], P + half * n, P - half * n, ends[0]]
+    hull = cv2.convexHull(np.array(quad + [heel],
+                                   dtype=np.float32)).reshape(-1, 2)
+    poly = hull if len(hull) == 5 else np.array(quad)
+    # Округление, а не усечение: пятка лежит ровно в вершине контура, и
+    # отбрасывание дробной части сдвигало бы ребро внутрь на целый пиксель --
+    # вершина оказывалась снаружи собственного контура.
+    return np.round(poly).astype(np.int32)
+
+
+# Сустав и две фигуры, которые в нём сходятся: (точка, ближняя пара, дальняя).
+JOINT_WEDGE_SPECS = ((13, (11, 13), (13, 15)),
+                     (14, (12, 14), (14, 16)),
+                     (25, (23, 25), (25, 27)),
+                     (26, (24, 26), (26, 28)))
+
+
+def _pair_limb_quad(pair, points, S, S_hip, limb_widths=None,
+                    limb_grow=None):
+    """Фигура конечности для пары точек -- ровно та, что строит модель.
+
+    У бедра ширина в тазобедренном конце всегда номинальная, а в колене --
+    калиброванная (так же, как в build_thigh_quads), у остальных пар обе
+    ширины берутся из limb_widths_px.
+    """
+    A, B = points(pair[0]), points(pair[1])
+    if A is None or B is None:
+        return None
+    if pair in THIGH_PAIRS:
+        coef = config.STICKMAN_LIMB_COEFS.get(pair)
+        if coef is None:
+            return None
+        scale = limb_scale(pair, S, S_hip)
+        k_knee = None if limb_widths is None else limb_widths.get(pair[1])
+        widths = (coef * scale,
+                  (coef if k_knee is None else float(k_knee)) * scale)
+    else:
+        widths = limb_widths_px(pair, S, S_hip, limb_widths, limb_grow)
+        if widths is None:
+            return None
+    return _build_limb_quad(A, B, widths[0], widths[1])
+
+
+def build_joint_wedges(landmarks, region, frame_w, frame_h, limb_widths=None,
+                       limb_grow=None):
+    """Фигуры, закрывающие излом в локтях и коленях.
+
+    Возвращает {'joint_tris': [...], 'forearm_squares': [...]}.
+
+    joint_tris -- по два треугольника на сустав: точка сустава и две вершины
+    сторон, проходящих через него, -- ближней фигуры (плечо/бедро) и дальней
+    (предплечье/голень), взятые с одной стороны конечности. На согнутой руке
+    между двумя четырёхугольниками с внешней стороны остаётся клин, эти
+    треугольники его и закрывают.
+
+    forearm_squares -- квадрат на локтевой стороне плечевой кости, когда
+    предплечье короче её в STICKMAN_FOREARM_SHORT_RATIO раз и более: рука
+    смотрит в камеру, её собственная фигура вырождается в полоску, а кисть
+    занимает на кадре примерно квадрат со стороной локтевого ребра. Сторона
+    квадрата -- само это ребро, растёт он от локтя дальше по оси плеча.
+    """
+    out = {'joint_tris': [], 'forearm_squares': []}
+
+    def points(idx):
+        return _get_point_px(landmarks, idx, region, frame_w, frame_h)
+
+    sh_l, sh_r = points(LEFT_SHOULDER), points(RIGHT_SHOULDER)
+    if sh_l is None or sh_r is None:
+        return out
+    S = float(np.linalg.norm(sh_r - sh_l))
+    if S < 1e-6:
+        return out
+    hip_l, hip_r = points(LEFT_HIP), points(RIGHT_HIP)
+    S_hip = S
+    if hip_l is not None and hip_r is not None:
+        d_hip = float(np.linalg.norm(hip_r - hip_l))
+        if d_hip > 1e-6:
+            S_hip = d_hip
+
+    for joint, prox_pair, dist_pair in JOINT_WEDGE_SPECS:
+        prox = _pair_limb_quad(prox_pair, points, S, S_hip, limb_widths,
+                               limb_grow)
+        if prox is None:
+            continue
+        J = points(joint)
+        dist = _pair_limb_quad(dist_pair, points, S, S_hip, limb_widths,
+                               limb_grow)
+
+        # Квадрат: только для рук и только при вырожденном предплечье.
+        if joint in (13, 14):
+            far = points(dist_pair[1])
+            near = points(prox_pair[0])
+            if forearm_degenerate(near, J, far):
+                square = _square_on_end_side(prox, J, near)
+                if square is not None:
+                    out['forearm_squares'].append(square)
+
+        if J is None or dist is None:
+            continue
+        # Порядок вершин задан в _build_limb_quad: [B+n, A+n, A-n, B-n].
+        # Значит сторона +n ближней фигуры -- вершина 0, дальней -- вершина 1,
+        # сторона -n -- вершины 3 и 2. Нормаль у обеих повёрнута от своей оси
+        # одинаково, поэтому пары вершин лежат по одну сторону конечности.
+        for i_prox, i_dist in ((0, 1), (3, 2)):
+            out['joint_tris'].append(np.round(np.array(
+                [J, prox[i_prox], dist[i_dist]], dtype=np.float64)).astype(np.int32))
+    return out
+
+
+def forearm_degenerate(near, joint, far):
+    """Предплечье вырождено: короче плечевой кости в STICKMAN_FOREARM_SHORT_RATIO
+    раз и более (рука смотрит в камеру). near/joint/far -- плечо, локоть, кисть.
+    """
+    if near is None or joint is None or far is None:
+        return False
+    len_prox = float(np.linalg.norm(np.asarray(joint) - np.asarray(near)))
+    len_dist = float(np.linalg.norm(np.asarray(far) - np.asarray(joint)))
+    if len_prox < 1e-6:
+        return False
+    return len_dist * config.STICKMAN_FOREARM_SHORT_RATIO <= len_prox
+
+
+def _square_on_end_side(quad, joint, near):
+    """Квадрат на стороне фигуры, проходящей через сустав (конец 'B').
+
+    Растёт от этой стороны прочь от ближнего сустава near, на длину самой
+    стороны. Возвращает контур (4, 2) int32 или None.
+    """
+    P1, P2 = [np.asarray(v, dtype=np.float64) for v in limb_end_points(quad, 'B')]
+    side = float(np.linalg.norm(P2 - P1))
+    if side < 1e-6:
+        return None
+    d = np.asarray(joint, dtype=np.float64) - np.asarray(near, dtype=np.float64)
+    length = float(np.linalg.norm(d))
+    if length < 1e-6:
+        return None
+    d = d / length
+    return np.round(np.array([P1, P2, P2 + side * d, P1 + side * d],
+                             dtype=np.float64)).astype(np.int32)
+
+
+def drop_top_edge_below_frame(TL, TR, n_down, frame_h, margin=2.0):
+    """Опускает верхнее ребро TL-TR по нормали n_down до выхода за низ кадра.
+
+    Возвращает пару нижних вершин прямоугольника: обе строго ниже последней
+    строки кадра, ребро остаётся параллельным TL-TR и перпендикулярным
+    боковым сторонам. Если нормаль почти горизонтальна (человек лежит),
+    опускание вырождено -- ребро уносится на две высоты кадра, чтобы фигура
+    заведомо покрыла низ.
+    """
+    TL = np.asarray(TL, dtype=np.float64)
+    TR = np.asarray(TR, dtype=np.float64)
+    n_down = np.asarray(n_down, dtype=np.float64)
+    ny = float(n_down[1])
+    if ny <= 1e-6:
+        h = 2.0 * float(frame_h)
+    else:
+        h = max((frame_h - 1 - float(TL[1])) / ny,
+                (frame_h - 1 - float(TR[1])) / ny) + margin
+        h = max(h, margin)
+    return TL + h * n_down, TR + h * n_down
+
+
+# Плечевая кость и её предплечье: (пара плеча, пара предплечья, ключ JSON).
+ARM_FRAME_SPECS = (((11, 13), (13, 15), '11_13'),
+                   ((12, 14), (14, 16), '12_14'))
+
+
+def _point_in_frame(point, frame_w, frame_h):
+    """Точка внутри кадра (кромка считается кадром)."""
+    x, y = float(point[0]), float(point[1])
+    return 0 <= x <= frame_w - 1 and 0 <= y <= frame_h - 1
+
+
+def _frame_exit_distance(point, u, frame_w, frame_h):
+    """Сколько пройти из point вдоль u, чтобы выйти за кадр (0 -- уже вне)."""
+    x, y = float(point[0]), float(point[1])
+    if not _point_in_frame(point, frame_w, frame_h):
+        return 0.0
+    ts = []
+    if u[0] > 1e-9:
+        ts.append((frame_w - 1 - x) / u[0])
+    elif u[0] < -1e-9:
+        ts.append(x / -u[0])
+    if u[1] > 1e-9:
+        ts.append((frame_h - 1 - y) / u[1])
+    elif u[1] < -1e-9:
+        ts.append(y / -u[1])
+    return min(ts) if ts else 0.0
+
+
+def extend_limb_quad_out_of_frame(quad, A, B, frame_w, frame_h, margin=2.0):
+    """Продлевает фигуру конечности от A к B, пока её дальняя сторона целиком
+    не выйдет за кадр.
+
+    Двигаются только две вершины конца 'B', поэтому ближний конец (у сустава)
+    и ширина дальней стороны остаются прежними. Возвращает новый контур
+    int32; если продлевать некуда (направление вырождено), -- исходный.
+    """
+    d = np.asarray(B, dtype=np.float64) - np.asarray(A, dtype=np.float64)
+    length = float(np.linalg.norm(d))
+    if length < 1e-6:
+        return quad
+    u = d / length
+    q = np.asarray(quad, dtype=np.float64).copy()
+    # Вершина на самой кромке кадра ещё в нём: продлевать надо, пока обе
+    # вершины не окажутся строго снаружи. Сдвиг для обеих одинаков, иначе
+    # дальняя сторона перекосится.
+    inside = [i for i in LIMB_END_IDX['B']
+              if _point_in_frame(q[i], frame_w, frame_h)]
+    if not inside:
+        return quad
+    t = max(_frame_exit_distance(q[i], u, frame_w, frame_h) for i in inside)
+    for i in LIMB_END_IDX['B']:
+        q[i] = q[i] + (t + margin) * u
+    return np.round(q).astype(np.int32)
+
+
+def arm_frame_extend_flags(landmarks, region, frame_w, frame_h,
+                           limb_widths=None, limb_grow=None):
+    """Каким плечевым костям нужно продление за кадр.
+
+    Условие: сама кость видна, а её предплечье -- нет. Продолжать руку нечем,
+    поэтому её фигура тянется по своей оси, пока обе вершины дальнего конца
+    не уйдут за кадр (см. extend_limb_quad_out_of_frame). Условие проверяется
+    на КАЖДОМ кадре по текущим точкам позы, а не берётся из калибровки: рука
+    выходит из кадра и возвращается по ходу видео.
+
+    Возвращает {'11_13': bool, '12_14': bool}.
+    """
+    flags = {key: False for _, _, key in ARM_FRAME_SPECS}
+    sh_l = _get_point_px(landmarks, LEFT_SHOULDER, region, frame_w, frame_h)
+    sh_r = _get_point_px(landmarks, RIGHT_SHOULDER, region, frame_w, frame_h)
+    if sh_l is None or sh_r is None:
+        return flags
+    S = float(np.linalg.norm(sh_r - sh_l))
+    if S < 1e-6:
+        return flags
+
+    def point(idx):
+        return _get_point_px(landmarks, idx, region, frame_w, frame_h)
+
+    for pair, forearm, key in ARM_FRAME_SPECS:
+        A, B = point(pair[0]), point(pair[1])
+        if A is None or B is None:
+            continue
+        if point(forearm[0]) is not None and point(forearm[1]) is not None:
+            continue                     # предплечье видно -- продлевать нечего
+        flags[key] = True
+    return flags
+
+
+def arm_extend_wanted(arm_extend, pair):
+    """Стоит ли флаг продления для пары плечевой кости (ключи JSON -- строки)."""
+    if not arm_extend:
+        return False
+    key = '%d_%d' % pair
+    return bool(arm_extend.get(key, False))
+
+
+def build_body_rects(landmarks, region, frame_w, frame_h, limb_widths=None,
+                     limb_grow=None):
     """Строит фигуры частей тела в координатах полного кадра.
 
     limb_widths -- калиброванные коэффициенты ширины по точкам {индекс: K}.
@@ -587,9 +949,20 @@ def build_body_rects(landmarks, region, frame_w, frame_h, limb_widths=None):
     rects = {'arms': [], 'legs': [], 'palms': [], 'feet': [],
              'arm_tops_quad': [], 'S': S, 'S_hip': S_hip}
 
+    # Рука уходит из кадра: предплечья не видно, а фигура плечевой кости
+    # упирается в границу. Тогда она продлевается до полного выхода дальней
+    # стороны за кадр -- и здесь, и в маске модели при отслеживании.
+    arm_flags = arm_frame_extend_flags(landmarks, region, frame_w, frame_h,
+                                       limb_widths, limb_grow)
+    rects['arm_extend'] = arm_flags
+
+    # Голени запоминаются по паре: на их нижнюю сторону опираются фигуры
+    # ступней, а брать голень по порядку в списке нельзя -- при невидимых
+    # точках нога в список не попадает.
+    shin_quads = {}
     for pairs, key in ((ARM_PAIRS, 'arms'), (SHIN_PAIRS, 'legs')):
         for pair in pairs:
-            widths = limb_widths_px(pair, S, S_hip, limb_widths)
+            widths = limb_widths_px(pair, S, S_hip, limb_widths, limb_grow)
             if widths is None:
                 continue
             A, B = point(pair[0]), point(pair[1])
@@ -597,49 +970,57 @@ def build_body_rects(landmarks, region, frame_w, frame_h, limb_widths=None):
                 continue
             rect = _build_limb_quad(A, B, widths[0], widths[1])
             if rect is not None:
+                if arm_extend_wanted(arm_flags, pair):
+                    rect = extend_limb_quad_out_of_frame(rect, A, B,
+                                                         frame_w, frame_h)
                 rects[key].append(rect)
+                if pair in SHIN_PAIRS:
+                    shin_quads[pair] = rect
 
-    for specs, key, width_coef, ext_coef, scale in (
-            (PALM_SPECS, 'palms', config.STICKMAN_PALM_COEF,
-             config.STICKMAN_PALM_EXTEND_COEF, S),
-            (FOOT_SPECS, 'feet', config.STICKMAN_FOOT_COEF,
-             config.STICKMAN_FOOT_EXTEND_COEF, S_hip)):
-        for joint_idx, distal_ids in specs:
-            A = point(joint_idx)
-            if A is None:
-                continue
-            # Дальний конец -- середина видимых точек (одна точка -- она сама)
-            distal = [q for q in (point(i) for i in distal_ids) if q is not None]
-            if not distal:
-                continue
-            B = np.mean(distal, axis=0)
-            rect = _build_extended_rect(A, B, width_coef * scale, ext_coef)
-            if rect is not None:
-                rects[key].append(rect)
+    for joint_idx, distal_ids in PALM_SPECS:
+        A = point(joint_idx)
+        if A is None:
+            continue
+        # Дальний конец -- середина видимых точек (одна точка -- она сама)
+        distal = [q for q in (point(i) for i in distal_ids) if q is not None]
+        if not distal:
+            continue
+        B = np.mean(distal, axis=0)
+        rect = _build_extended_rect(A, B, config.STICKMAN_PALM_COEF * S,
+                                    config.STICKMAN_PALM_EXTEND_COEF)
+        if rect is not None:
+            rects['palms'].append(rect)
 
+    for shin_pair, (ankle_idx, heel_idx, toe_idx) in FOOT_PARTS:
+        ankle, toe = point(ankle_idx), point(toe_idx)
+        if ankle is None or toe is None:
+            continue
+        poly = build_foot_poly(ankle, point(heel_idx), toe, S_hip,
+                               shin_quads.get(shin_pair))
+        if poly is not None:
+            rects['feet'].append(poly)
+            continue
+        # Нет пятки или голени -- прежний прямоугольник вдоль 27-31.
+        rect = _build_extended_rect(ankle, toe,
+                                    config.STICKMAN_FOOT_COEF * S_hip,
+                                    config.STICKMAN_FOOT_EXTEND_COEF)
+        if rect is not None:
+            rects['feet'].append(rect)
+
+    rects.update(build_joint_wedges(landmarks, region, frame_w, frame_h,
+                                    limb_widths, limb_grow))
     rects['arm_tops_quad'] = build_arm_tops_quad(
         landmarks, region, frame_w, frame_h, limb_widths=limb_widths)
 
     return rects
 
 
-def _build_palm_square(wrist, side):
-    """Квадрат ладони, центрированный в запястье, axis-aligned (по кадру)."""
-    half = side / 2.0
-    x, y = wrist
-    return np.array([
-        [x - half, y - half],
-        [x + half, y - half],
-        [x + half, y + half],
-        [x - half, y + half],
-    ], dtype=np.int32)
-
-
 # ------------------------------------------------------------------
 # Сборка модели
 # ------------------------------------------------------------------
 def build_upper_body_hull(landmarks, region, frame_w, frame_h,
-                          head_corners, torso_quad, limb_widths=None):
+                          head_corners, torso_quad, limb_widths=None,
+                          limb_grow=None):
     """Выпуклый многоугольник XABCDY между верхом рук и головой.
 
     A, B -- плечевая сторона фигуры отрезка 14-12;
@@ -683,7 +1064,7 @@ def build_upper_body_hull(landmarks, region, frame_w, frame_h,
     pts = []
     for pair in UPPER_ARM_PAIRS:
         A, B = point(pair[0]), point(pair[1])
-        widths = limb_widths_px(pair, S, S, limb_widths)
+        widths = limb_widths_px(pair, S, S, limb_widths, limb_grow)
         if A is None or B is None or widths is None:
             return []
         rect = _build_limb_quad(A, B, widths[0], widths[1])
@@ -710,7 +1091,8 @@ def build_upper_body_hull(landmarks, region, frame_w, frame_h,
     return [hull.reshape(-1, 2).astype(np.int32)]
 
 
-def build_arm_tops_quad(landmarks, region, frame_w, frame_h, limb_widths=None):
+def build_arm_tops_quad(landmarks, region, frame_w, frame_h, limb_widths=None,
+                        limb_grow=None):
     """Четырёхугольник ABCD по плечевым сторонам фигур рук.
 
     A, B -- плечевая сторона фигуры отрезка 14-12;
@@ -735,7 +1117,7 @@ def build_arm_tops_quad(landmarks, region, frame_w, frame_h, limb_widths=None):
     pts = []
     for pair in UPPER_ARM_PAIRS:
         A, B = point(pair[0]), point(pair[1])
-        widths = limb_widths_px(pair, S, S, limb_widths)
+        widths = limb_widths_px(pair, S, S, limb_widths, limb_grow)
         if A is None or B is None or widths is None:
             return []
         rect = _build_limb_quad(A, B, widths[0], widths[1])
@@ -747,22 +1129,91 @@ def build_arm_tops_quad(landmarks, region, frame_w, frame_h, limb_widths=None):
     return [hull.reshape(-1, 2).astype(np.int32)]
 
 
+# Треугольник плеча: (пара плечевой кости, вершина торса своей стороны).
+# TR стоит со стороны точки 11, TL -- со стороны точки 12: обе вершины
+# строятся лучом из своего плеча (см. calibrate_torso).
+ARM_TRI_SPECS = (((11, 13), 'TR', RIGHT_SHOULDER),
+                 ((12, 14), 'TL', LEFT_SHOULDER))
+
+
+def build_arm_shoulder_tris(landmarks, region, frame_w, frame_h, torso_quad,
+                            limb_widths=None, limb_grow=None):
+    """Треугольники плеча: откалиброванная вершина -- точка плеча -- рука.
+
+    Третья вершина -- НАРУЖНАЯ вершина прямоугольника плечевой кости у самого
+    плеча (из двух вершин этого конца берётся дальняя от второго плеча).
+    Треугольник закрывает клин между скатом плеча, который даёт луч под
+    CALIBRATION_SHOULDER_RAY_DEG, и прямоугольником руки.
+
+    torso_quad -- контур торса из калибровки; None -- фигуры не строятся.
+    Возвращает список контуров (3, 2) int32.
+    """
+    if torso_quad is None:
+        return []
+
+    def point(idx):
+        return _get_point_px(landmarks, idx, region, frame_w, frame_h)
+
+    sh_l, sh_r = point(LEFT_SHOULDER), point(RIGHT_SHOULDER)
+    if sh_l is None or sh_r is None:
+        return []
+    S = float(np.linalg.norm(sh_r - sh_l))
+    if S < 1e-6:
+        return []
+
+    tris = []
+    for pair, vertex_name, other_idx in ARM_TRI_SPECS:
+        A, B = point(pair[0]), point(pair[1])
+        other = point(other_idx)
+        if A is None or B is None or other is None:
+            continue
+        T = torso_vertex(torso_quad, vertex_name)
+        if T is None:
+            continue
+        widths = limb_widths_px(pair, S, S, limb_widths, limb_grow)
+        if widths is None:
+            continue
+        rect = _build_limb_quad(A, B, widths[0], widths[1])
+        if rect is None:
+            continue
+        # 'A' -- конец прямоугольника у плеча; наружная из двух его вершин
+        outer = max(limb_end_points(rect, 'A'),
+                    key=lambda p: float(np.linalg.norm(p - other)))
+        tris.append(np.round(np.array([T, A, outer],
+                                      dtype=np.float64)).astype(np.int32))
+    return tris
+
+
 def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
-                        torso_quad=None, head_corners=None, limb_widths=None):
+                        torso_quad=None, head_corners=None, limb_widths=None,
+                        neck_quad=None, shoulders_bottom_quads=None,
+                        lower_neck_quad=None, limb_grow=None):
     """Строит бинарную маску модели тела (uint8, 0/255) в координатах полного кадра.
 
     limb_widths -- калиброванные коэффициенты ширины по точкам {индекс: K}.
     None -- конечности строятся прямоугольниками постоянной ширины, как раньше.
 
-    torso_quad -- четырёхугольник торса [TL, TR, BR, BL] из калибровки.
-    Нужен только для треугольников торс-нога (24-26-BL, 23-25-BR): свой торс
-    этой функции опирается нижними вершинами прямо на бёдра 23/24, и такие
-    треугольники выродились бы в дубли треугольников таза. None -- треугольники
-    торс-нога не строятся.
+    torso_quad -- контур торса из калибровки (четырёхугольник плечи-торс или
+    шестиугольник плечи-живот-торс). Заливается в маску как есть и служит
+    опорой четырёхугольникам бёдер. None -- торс строится по точкам позы
+    (_build_torso_poly), но при STICKMAN_TORSO_SCALE = 0 он вырожден.
 
-    head_corners -- прямоугольник головы из калибровки. Нужен для
-    многоугольника XABCDY; свой прямоугольник головы этой функции вырожден при нулевых
-    STICKMAN_HEAD_*_COEF. None -- области не строятся.
+    head_corners -- прямоугольник головы из калибровки. Заливается в маску.
+    None -- голова строится по точкам позы (_build_head_rect), но при нулевых
+    STICKMAN_HEAD_*_COEF она вырождена.
+
+    neck_quad -- трапеция шеи (build_neck_quad_from_torso_and_head). Своей шеи
+    у маски нет: она строится от откалиброванных головы и торса, поэтому
+    приходит готовой. None -- шея в маску не входит.
+
+    shoulders_bottom_quads -- список пятиугольников "плечи-низ"
+    (build_shoulders_bottom_quads): низ силуэта на половинном кадре без бёдер,
+    по одному на каждую сторону, чья рука не видна. Приходят готовыми.
+
+    lower_neck_quad -- шея во весь низ кадра (build_lower_neck_quad): плечи не
+    видны, торса нет, всё ниже головы считается шеей. Если плечи не видны, то
+    из фигур в маску входят только голова и эта шея -- остальное строится от
+    ширины плеч, которой нет.
 
     Возвращает маску (frame_h, frame_w) или None.
     """
@@ -775,27 +1226,51 @@ def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
     # Ширина плеч S
     sh_l = _get_point_px(landmarks, LEFT_SHOULDER, region, frame_w, frame_h)
     sh_r = _get_point_px(landmarks, RIGHT_SHOULDER, region, frame_w, frame_h)
-    if sh_l is None or sh_r is None:
-        return None
-    S = np.linalg.norm(sh_r - sh_l)
-    if S < 1e-6:
-        return None
+    S = (np.linalg.norm(sh_r - sh_l)
+         if sh_l is not None and sh_r is not None else 0.0)
 
     mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
 
-    # 1. Торс
-    torso = _build_torso_poly(landmarks, region, frame_w, frame_h)
+    # Плечи не видны: ширины плеч нет, а от неё считаются все размеры модели.
+    # Тогда в маску входят только фигуры, построенные без неё, -- голова и
+    # шея во весь низ кадра (см. lower_neck_quad).
+    if S < 1e-6:
+        empty = True
+        for poly in (head_corners, lower_neck_quad):
+            if poly is None:
+                continue
+            cv2.fillPoly(mask, [np.round(np.asarray(
+                poly, dtype=np.float64)).astype(np.int32)], 255)
+            empty = False
+        return None if empty else mask
+
+    # 1. Торс: откалиброванный контур, если он передан. Свой торс по точкам
+    # позы -- фолбэк для вызовов без калибровки (evaluate_stickman_accuracy).
+    torso = (np.asarray(torso_quad, dtype=np.float64)
+             if torso_quad is not None
+             else _build_torso_poly(landmarks, region, frame_w, frame_h))
     if torso is not None:
-        cv2.fillPoly(mask, [torso], 255)
+        cv2.fillPoly(mask, [np.round(torso).astype(np.int32)], 255)
 
-    # neck = _build_neck_quad(landmarks, region, frame_w, frame_h, S)
-    # if neck is not None:
-    #     cv2.fillPoly(mask, [neck], 255)
+    # 1b. "Плечи-низ": продолжение торса до нижней кромки кадра. Строится от
+    # откалиброванных вершин плеч, поэтому приходит готовым.
+    for quad in (shoulders_bottom_quads or []):
+        cv2.fillPoly(mask, [np.round(np.asarray(
+            quad, dtype=np.float64)).astype(np.int32)], 255)
 
-    # 3. Голова
-    head = _build_head_rect(landmarks, region, frame_w, frame_h, S)
+    # 2. Шея: строится от откалиброванных головы и торса, поэтому приходит
+    # готовой трапецией.
+    if neck_quad is not None:
+        cv2.fillPoly(mask, [np.round(np.asarray(neck_quad,
+                                                dtype=np.float64)).astype(np.int32)], 255)
+
+    # 3. Голова: откалиброванный прямоугольник, если он передан. Свой -- тот же
+    # фолбэк, что и у торса.
+    head = (np.asarray(head_corners, dtype=np.float64)
+            if head_corners is not None
+            else _build_head_rect(landmarks, region, frame_w, frame_h, S))
     if head is not None:
-        cv2.fillPoly(mask, [head], 255)
+        cv2.fillPoly(mask, [np.round(head).astype(np.int32)], 255)
 
     # 4. Конечности (8 прямоугольников).
     # Ноги масштабируются шириной таза |23-24|, руки -- шириной плеч.
@@ -807,6 +1282,12 @@ def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
         if d_hip > 1e-6:
             S_hip = d_hip
 
+    # Рука без видимого предплечья тянется за кадр -- условие проверяется по
+    # текущим точкам позы, поэтому флаги считаются здесь же.
+    arm_extend = arm_frame_extend_flags(landmarks, region, frame_w, frame_h,
+                                        limb_widths, limb_grow)
+
+    shin_quads = {}
     for pair in config.STICKMAN_LIMB_COEFS:
         a, b = pair
         A = _get_point_px(landmarks, a, region, frame_w, frame_h)
@@ -815,21 +1296,47 @@ def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
             continue
         if pair in THIGH_PAIRS:
             continue          # верх ноги закрывается четырёхугольником, п.7
-        widths = limb_widths_px(pair, S, S_hip, limb_widths)
+        widths = limb_widths_px(pair, S, S_hip, limb_widths, limb_grow)
         if widths is None:
             continue
         rect = _build_limb_quad(A, B, widths[0], widths[1])
         if rect is not None:
+            if arm_extend_wanted(arm_extend, pair):
+                rect = extend_limb_quad_out_of_frame(rect, A, B,
+                                                     frame_w, frame_h)
             cv2.fillPoly(mask, [rect], 255)
+            if pair in SHIN_PAIRS:
+                shin_quads[pair] = rect
 
-    # 5. Ладони (квадраты в запястьях)
-    palm_side = config.STICKMAN_PALM_COEF * S
-    for wrist_idx in (LEFT_WRIST, RIGHT_WRIST):
-        wrist = _get_point_px(landmarks, wrist_idx, region, frame_w, frame_h)
-        if wrist is None:
+    # 4b. Треугольники плеча: клин между скатом плеча (луч под углом) и
+    # прямоугольником плечевой кости. Нужен откалиброванный торс.
+    for tri in build_arm_shoulder_tris(landmarks, region, frame_w, frame_h,
+                                       torso_quad, limb_widths, limb_grow):
+        cv2.fillPoly(mask, [tri], 255)
+
+    # 4c. Клинья в локтях и коленях: треугольники между фигурами соседних
+    # костей и квадрат вместо вырожденного предплечья.
+    wedges = build_joint_wedges(landmarks, region, frame_w, frame_h, limb_widths,
+                                limb_grow)
+    for poly in wedges['joint_tris'] + wedges['forearm_squares']:
+        cv2.fillPoly(mask, [poly], 255)
+
+    # 5. Ладони: те же прямоугольники, что строит build_body_rects и что
+    # рисуются в calibration_result.png -- от запястья к середине видимых
+    # точек кисти. Прежние осевые квадраты в запястьях убраны.
+    for joint_idx, distal_ids in PALM_SPECS:
+        A = _get_point_px(landmarks, joint_idx, region, frame_w, frame_h)
+        if A is None:
             continue
-        square = _build_palm_square(wrist, palm_side)
-        cv2.fillPoly(mask, [square], 255)
+        distal = [q for q in (_get_point_px(landmarks, i, region, frame_w, frame_h)
+                              for i in distal_ids) if q is not None]
+        if not distal:
+            continue
+        rect = _build_extended_rect(A, np.mean(distal, axis=0),
+                                    config.STICKMAN_PALM_COEF * S,
+                                    config.STICKMAN_PALM_EXTEND_COEF)
+        if rect is not None:
+            cv2.fillPoly(mask, [rect], 255)
 
     # 6. Верх ног: четырёхугольники BL/BR + вершины у колена (нужен торс)
     for q in build_thigh_quads(landmarks, region, frame_w, frame_h, torso_quad,
@@ -842,6 +1349,25 @@ def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
     for q in build_arm_tops_quad(landmarks, region, frame_w, frame_h,
                                  limb_widths=limb_widths):
         cv2.fillPoly(mask, [q], 255)
+
+    # 8. Ступни: та же фигура, что рисуется при калибровке и трекинге.
+    # Пятка -- индекс 29, носок -- 31, поэтому нужен полный список точек:
+    # проверки в начале функции (len < 29) для них недостаточно.
+    if len(landmarks) > RIGHT_FOOT_INDEX:
+        for shin_pair, (ankle_idx, heel_idx, toe_idx) in FOOT_PARTS:
+            ankle = _get_point_px(landmarks, ankle_idx, region, frame_w, frame_h)
+            toe = _get_point_px(landmarks, toe_idx, region, frame_w, frame_h)
+            if ankle is None or toe is None:
+                continue
+            heel = _get_point_px(landmarks, heel_idx, region, frame_w, frame_h)
+            poly = build_foot_poly(ankle, heel, toe, S_hip,
+                                   shin_quads.get(shin_pair))
+            if poly is None:
+                poly = _build_extended_rect(
+                    ankle, toe, config.STICKMAN_FOOT_COEF * S_hip,
+                    config.STICKMAN_FOOT_EXTEND_COEF)
+            if poly is not None:
+                cv2.fillPoly(mask, [poly], 255)
 
     return mask
 

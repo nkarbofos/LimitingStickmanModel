@@ -37,9 +37,11 @@ from mediapipe.tasks.python import vision
 
 from . import config
 from .calibration import (calibrate_head, calibrate_torso,
-                          calibrate_limb_widths, save_calibration_params)
+                          calibrate_limb_widths, calibrate_neck,
+                          calibrate_lower_neck, save_calibration_params)
 from .download import ensure_models
-from .stickman_model import build_body_rects, build_thigh_quads
+from .stickman_model import (build_body_rects, build_thigh_quads,
+                             build_arm_shoulder_tris)
 from .tracking import build_neck_quad_from_torso_and_head
 from .visualization import draw_pose_landmarks
 
@@ -54,31 +56,52 @@ _RECT_GROUPS = (
     ('feet',  'ступни',  'CALIB_FOOT_COLOR'),
     ('thigh_quads', 'четыр. бёдер', 'CALIB_THIGH_QUAD_COLOR'),
     ('arm_tops_quad', 'четыр. ABCD', 'CALIB_ARM_TOPS_COLOR'),
+    ('arm_tris', 'треуг. плеча', 'CALIB_ARM_TRI_COLOR'),
+    ('joint_tris', 'треуг. суставов', 'CALIB_JOINT_TRI_COLOR'),
+    ('forearm_squares', 'квадр. предплечья', 'CALIB_FOREARM_SQUARE_COLOR'),
 )
 
 
-def detect_chin(face_landmarker, image_bgr, origin):
-    """Подбородок (точка 152) на изображении, в координатах полного кадра.
+def detect_face(face_landmarker, image_bgr, origin):
+    """Подбородок и овал лица на изображении, в координатах полного кадра.
 
     origin -- смещение левого верхнего угла image_bgr в полном кадре.
-    Возвращает None, если лицо не найдено или овал лица неполон: без овала
-    точки подбородка попросту нет.
+    Возвращает (chin, oval, n_landmarks): точка 152, контур FACE_OVAL (N, 2)
+    и число точек разметки (0 -- лицо не найдено). Подбородок и овал -- None,
+    если лицо не найдено или разметка короче контура: без овала точки
+    подбородка попросту нет.
     """
     if image_bgr is None or image_bgr.size == 0:
-        return None
+        return None, None, 0
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     res = face_landmarker.detect(
         mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
     if not res.face_landmarks:
-        return None
+        return None, None, 0
     lm = res.face_landmarks[0]
     need = max(max(config.FACE_OVAL), config.CALIB_FACE_CHIN_INDEX)
     if len(lm) <= need:
-        return None
+        return None, None, len(lm)
     h, w = image_bgr.shape[:2]
+    oval = np.array([[lm[i].x * w + origin[0], lm[i].y * h + origin[1]]
+                     for i in config.FACE_OVAL], dtype=np.float64)
     chin = lm[config.CALIB_FACE_CHIN_INDEX]
-    return np.array([chin.x * w + origin[0], chin.y * h + origin[1]],
-                    dtype=np.float64)
+    chin_point = np.array([chin.x * w + origin[0], chin.y * h + origin[1]],
+                          dtype=np.float64)
+    return chin_point, oval, len(lm)
+
+
+def format_face_oval(oval, n_landmarks):
+    """Строка для печати: детектирован ли овал лица FACE_OVAL."""
+    if n_landmarks == 0:
+        return "НЕ детектирован (лицо не найдено)"
+    if oval is None:
+        return (f"НЕ детектирован (в разметке {n_landmarks} точек, "
+                f"нужно минимум {max(config.FACE_OVAL) + 1})")
+    w = oval[:, 0].max() - oval[:, 0].min()
+    h = oval[:, 1].max() - oval[:, 1].min()
+    return (f"детектирован, {len(oval)} точек, "
+            f"габарит {w:.0f}x{h:.0f} px")
 
 
 def head_crop_box(corners, frame_w, frame_h, expand):
@@ -113,6 +136,23 @@ _WIDTH_POINT_LABELS = (
     (25, 'колено L'), (27, 'лодыжка L'),
     (26, 'колено R'), (28, 'лодыжка R'),
 )
+
+
+def print_neck_profile(neck_result):
+    """Печатает, насколько трапеция шеи поджалась к маске на каждом уровне."""
+    if not neck_result:
+        print("\nШея: профиль не построен (нет головы или торса) -- трапеция")
+        return
+    tl, tr = neck_result['tl_coefs'], neck_result['tr_coefs']
+    n = len(tl)
+    print("\nШея: доля полуширины трапеции по уровням "
+          "(1.00 -- маска доходит до трапеции)")
+    print("  уровень:  " + " ".join("%5.2f" % (i / (n - 1.0)) for i in range(n)))
+    print("  сторона TL:" + " ".join("%5.2f" % v for v in tl))
+    print("  сторона TR:" + " ".join("%5.2f" % v for v in tr))
+    trimmed = sum(1 for v in tl + tr if v < 0.99)
+    print("  поджато %d из %d вершин, самая узкая %.2f"
+          % (trimmed, 2 * n, min(tl + tr)))
 
 
 def print_limb_widths(limb_widths):
@@ -296,7 +336,9 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     # тесном кропе головы (после калибровки головы).
     print("Загрузка face_landmarker...")
     face_landmarker = create_face_landmarker(face_path)
-    chin_point = detect_chin(face_landmarker, crop, (x1_c, y1_c))
+    chin_point, face_oval, n_face_lm = detect_face(face_landmarker, crop,
+                                                   (x1_c, y1_c))
+    print(f"Овал лица (FACE_OVAL): {format_face_oval(face_oval, n_face_lm)}")
     if chin_point is not None:
         print(f"Подбородок найден: ({chin_point[0]:.1f}, {chin_point[1]:.1f})")
     else:
@@ -310,21 +352,25 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
 
     # Ширина конечностей замеряется по маске ПЕРВОЙ: от неё зависят фигуры
     # рук, а те служат барьером при калибровке торса.
-    limb_widths = calibrate_limb_widths(mask_full, pose_landmarks, region,
+    limb_widths, limb_grow = calibrate_limb_widths(mask_full, pose_landmarks, region,
                                         frame_w, frame_h)
     print_limb_widths(limb_widths)
 
     # Фигуры частей тела считаем ДО калибровки торса: руки и ладони служат
     # барьером для вытягивания нижних вершин торса (BL, BR).
     body_rects = build_body_rects(pose_landmarks, region, frame_w, frame_h,
-                                  limb_widths=limb_widths)
+                                  limb_widths=limb_widths, limb_grow=limb_grow)
     barrier_rects = None
+    limb_rects = None
     if body_rects is not None:
         barrier_rects = body_rects['arms'] + body_rects['palms']
+        # Фигуры конечностей: в них не должна упираться линия живота.
+        limb_rects = body_rects['arms'] + body_rects['legs']
 
     torso_result = calibrate_torso(mask_full, pose_landmarks, region,
                                    frame_w, frame_h,
-                                   barrier_rects=barrier_rects)
+                                   barrier_rects=barrier_rects,
+                                   limb_rects=limb_rects)
 
     # Четырёхугольники верха ног: строятся только после торса -- им нужны
     # его нижние вершины BL и BR.
@@ -333,6 +379,11 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
             pose_landmarks, region, frame_w, frame_h,
             torso_result['quad'] if torso_result is not None else None,
             limb_widths=limb_widths)
+        # Треугольники плеча: тоже нужны вершины торса
+        body_rects['arm_tris'] = build_arm_shoulder_tris(
+            pose_landmarks, region, frame_w, frame_h,
+            torso_result['quad'] if torso_result is not None else None,
+            limb_widths=limb_widths, limb_grow=limb_grow)
 
     # Голова считается ПОСЛЕ торса: при отсутствии подбородка нижняя граница
     # головы подбирается по тому, как фигура (голова + шея) ложится на маску,
@@ -355,8 +406,10 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
             bx0, by0, bx1, by1 = box
             print(f"Повторный поиск лица на кропе головы "
                   f"{bx1 - bx0}x{by1 - by0} (+{(config.CALIB_HEAD_CROP_EXPAND - 1) * 100:.0f}%)...")
-            chin_point = detect_chin(face_landmarker,
-                                     frame_bgr[by0:by1, bx0:bx1], (bx0, by0))
+            chin_point, face_oval, n_face_lm = detect_face(
+                face_landmarker, frame_bgr[by0:by1, bx0:bx1], (bx0, by0))
+            print(f"  овал лица (FACE_OVAL): "
+                  f"{format_face_oval(face_oval, n_face_lm)}")
             if chin_point is None:
                 print("  лицо не обнаружено -- нижняя граница остаётся по IoU шеи")
             else:
@@ -368,6 +421,35 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
                                              torso_quad=torso_quad)
 
     face_landmarker.close()
+
+    # Плечи не видны -- торса нет, и всё, что ниже головы, считается шеей.
+    lower_neck_result = None
+    if torso_result is None and head_result is not None:
+        lower_neck_result = calibrate_lower_neck(
+            mask_full, head_result['corners'], frame_w, frame_h)
+
+    # Профиль шеи считается последним: ему нужны и готовая голова, и торс.
+    neck_result = calibrate_neck(
+        mask_full,
+        head_result['corners'] if head_result is not None else None,
+        torso_result['quad'] if torso_result is not None else None)
+    print_neck_profile(neck_result)
+
+    if limb_grow:
+        print("\nРаздвижение фигур по маске (доли масштаба пары, на сторону):")
+        for key in sorted(limb_grow):
+            print("  %-7s %.4f" % (key, limb_grow[key]))
+    elif config.CALIBRATION_LIMB_GROW_ENABLED:
+        print("\nРаздвижение фигур по маске: ни одна пара не раздвинулась")
+    else:
+        print("\nРаздвижение фигур по маске: выключено флагом "
+              "CALIBRATION_LIMB_GROW_ENABLED")
+
+    extended = [k for k, v in (body_rects or {}).get('arm_extend', {}).items() if v]
+    if extended:
+        print("\nПродление плечевых костей за кадр (предплечья не видно, "
+              "считается на каждом кадре): "
+              + ", ".join(sorted(extended)))
 
     if head_result is not None:
         print("\nГолова:")
@@ -381,7 +463,9 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
         src = head_result['down_source']
         src_ru = {'chin': 'по подбородку',
                   'neck_iou': 'подобран по шее',
-                  'symmetric': 'заглушка len_XN'}.get(src, src)
+                  'symmetric': 'заглушка len_XN'}.get(src.split('+')[0], src)
+        if src.endswith('+shoulders'):
+            src_ru += ', урезан линией плеч'
         print(f"  down_dist:               {head_result['down_dist']:.1f} px ({src_ru})")
         fit = head_result.get('neck_fit')
         if fit is not None:
@@ -406,8 +490,13 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
         print(f"  y_shoulders: {torso_result['y_shoulders']:.1f} px")
         print(f"  y_hips:      {torso_result['y_hips']:.1f} px")
         print(f"  y_bottom:    {torso_result['y_bottom']:.1f} px")
-        print(f"  ноги видны:  {torso_result['legs_visible']} "
-              f"({'BL/BR по отрезку бёдер' if torso_result['legs_visible'] else 'BL/BR по свисающей одежде'})")
+        if torso_result['legs_visible']:
+            _bottom_how = 'BL/BR по отрезку бёдер'
+        elif torso_result.get('torso_rect_below_frame'):
+            _bottom_how = 'прямоугольник от отрезка плеч за низ кадра'
+        else:
+            _bottom_how = 'BL/BR по свисающей одежде'
+        print(f"  ноги видны:  {torso_result['legs_visible']} ({_bottom_how})")
         print(f"  S (ширина плеч): {torso_result['S']:.1f} px")
         print(f"  Контур торса ({len(torso_result['quad'])} вершин):")
         print(f"    TL = {torso_result['TL'].astype(int).tolist()}")
@@ -421,7 +510,32 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
             print(f"    belly_depth_coef:     {torso_result['belly_depth_coef']:.4f}")
             print(f"    belly_ext_left_coef:  {torso_result['belly_ext_left_coef']:.4f}")
             print(f"    belly_ext_right_coef: {torso_result['belly_ext_right_coef']:.4f}")
+        else:
+            print(f"  Линия живота: не построена "
+                  f"({torso_result.get('belly_reason', 'причина не указана')})")
+        for idx in sorted(torso_result.get('side_bottom_quads', {})):
+            q = torso_result['side_bottom_quads'][idx]
+            print(f"  Пятиугольник плечи-низ (рука точки {idx} не видна):")
+            print("    " + " -> ".join(v.astype(int).tolist().__repr__()
+                                       for v in q))
+            print(f"    развод по низу / вынос точки A (доли ширины плеч): "
+                  f"{torso_result['side_bottom_coefs'][idx]:.4f} / "
+                  f"{torso_result['side_bottom_a_coefs'][idx]:.4f}")
+        def _spread(v):
+            return '--' if v is None else f'{v:.1f}'
+        print(f"  Верхние вершины: луч "
+              f"{config.CALIBRATION_SHOULDER_RAY_DEG:.0f} град. к отрезку плеч "
+              f"(TR от точки 11, TL от точки 12)")
+        print(f"    разворот рук (угол при плече, справочно): "
+              f"11-13 {_spread(torso_result.get('arm_spread_11'))}, "
+              f"12-14 {_spread(torso_result.get('arm_spread_12'))}")
         print(f"  Параметры для отслеживания (нормализованные):")
+        print(f"    Верхний отрезок TL-TR (доли ширины плеч):")
+        print(f"      перпендикуляр от середины 11-12: "
+              f"{torso_result['top_perp_coef']:.4f}")
+        print(f"      части отрезка (к TL / к TR):     "
+              f"{torso_result['top_left_len_coef']:.4f} / "
+              f"{torso_result['top_right_len_coef']:.4f}")
         print(f"    ext_left_coef:  {torso_result['ext_left_coef']:.4f}")
         print(f"    ext_right_coef: {torso_result['ext_right_coef']:.4f}")
         print(f"    Привязка к плечам (фолбэк):")
@@ -439,6 +553,17 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
             print(f"      (бёдра не видны при калибровке - используется фолбэк на плечи)")
     else:
         print("\nТорс: пропущен (плечи не видны)")
+        if lower_neck_result is not None:
+            q = lower_neck_result['quad']
+            print("\nШея во весь низ кадра (плечи не видны, торса нет):")
+            print(f"  верх = {q[0].astype(int).tolist()} .. {q[1].astype(int).tolist()}")
+            print(f"  низ  = {q[3].astype(int).tolist()} .. {q[2].astype(int).tolist()}")
+            print(f"  развод наружу (доли ширины низа головы): "
+                  f"{lower_neck_result['out_left_coef']:.4f} / "
+                  f"{lower_neck_result['out_right_coef']:.4f}")
+        elif head_result is not None:
+            print("Шея во весь низ кадра: не построена "
+                  "(маска не идёт ниже головы)")
 
     if head_result is None and torso_result is None:
         print("\n[!] Ни голова, ни торс не откалиброваны -- нечего сохранять.")
@@ -447,8 +572,10 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     # Сохранение параметров калибровки в JSON
     os.makedirs(os.path.dirname(os.path.abspath(params_path)) or ".", exist_ok=True)
     save_calibration_params(params_path, head_result, torso_result,
-                            limb_widths=limb_widths,
-                            video_path=video_path, frame_index=frame_index)
+                            limb_widths=limb_widths, neck_result=neck_result,
+                            video_path=video_path, frame_index=frame_index,
+                            lower_neck_result=lower_neck_result,
+                            limb_grow=limb_grow)
 
     # Визуализация на полном кадре
     overlay = frame_bgr.copy()
@@ -476,10 +603,35 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
         cv2.polylines(overlay, [quad_full], isClosed=True,
                       color=(255, 100, 0), thickness=2)
 
-    # Шея (из четырёхугольника торса и прямоугольника головы)
-    if config.DRAW_TRACKED_NECK and head_result is not None and torso_result is not None:
+    # Фигуры "плечи-низ" (половинный кадр без бёдер): полная и половинные
+    if torso_result is not None:
+        for quad in torso_result.get('shoulders_bottom_quads', []):
+            cv2.polylines(overlay, [np.asarray(quad).astype(np.int32)],
+                          isClosed=True,
+                          color=config.CALIB_SHOULDERS_BOTTOM_COLOR,
+                          thickness=2)
+
+    # Шея во весь низ кадра (плечи не видны)
+    if lower_neck_result is not None:
+        cv2.polylines(overlay, [lower_neck_result['quad'].astype(np.int32)],
+                      isClosed=True, color=config.CALIB_SHOULDERS_BOTTOM_COLOR,
+                      thickness=2)
+
+    # Линия живота (хорда ML-MR внутри шестиугольника: сами ML и MR уже
+    # обведены контуром торса, а сама линия -- нет).
+    if torso_result is not None and torso_result.get('has_belly'):
+        cv2.line(overlay,
+                 tuple(torso_result['ML'].astype(int).tolist()),
+                 tuple(torso_result['MR'].astype(int).tolist()),
+                 color=config.CALIB_BELLY_COLOR, thickness=2)
+
+    # Шея (из контура торса и прямоугольника головы, поджатая по профилю).
+    # Рисуется всегда, как голова и торс выше: DRAW_TRACKED_NECK управляет
+    # отрисовкой поверх маски при отслеживании, к картинке калибровки
+    # отношения не имеет.
+    if head_result is not None and torso_result is not None:
         neck_quad = build_neck_quad_from_torso_and_head(
-            torso_result['quad'], head_result['corners'])
+            torso_result['quad'], head_result['corners'], neck_result)
         if neck_quad is not None:
             cv2.polylines(overlay, [neck_quad.astype(np.int32)],
                           isClosed=True,
