@@ -458,6 +458,11 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
               f"в каждую сторону)")
         print(f"  От носа вправо/влево:    {head_result['right_dist']:.1f} / "
               f"{head_result['left_dist']:.1f} px")
+        print(f"  От середины ушей (якорь трекинга) вправо/влево/вверх/вниз: "
+              f"{head_result['anchor_right']:.1f} / "
+              f"{head_result['anchor_left']:.1f} / "
+              f"{head_result['anchor_up']:.1f} / "
+              f"{head_result['anchor_down']:.1f} px")
         print(f"  Высота:                  {head_result['height']:.1f} px")
         print(f"  len(XN) вверх:           {head_result['len_XN']:.1f} px")
         src = head_result['down_source']

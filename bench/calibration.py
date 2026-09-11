@@ -141,6 +141,40 @@ def _find_mask_boundary_along(mask, start_point, direction, max_dist):
     return X
 
 
+def _find_mask_boundary_beyond_frame(mask, start_point, direction, max_dist):
+    """Как _find_mask_boundary_along, но луч не останавливается о край кадра.
+
+    Пока точка внутри кадра -- обычный ход по маске. Как только луч вышел за
+    рамку, ход продолжается: каждая следующая точка проецируется на границу
+    кадра (координаты зажимаются в кадр), и проверяется маска уже в проекции.
+    Останов -- когда проекция сошла с маски.
+
+    Нужно плечам. Когда плечо срезано рамкой, луч упирается в неё и вершина
+    торса встаёт на кромке, хотя тело продолжается за кадром. Силуэт вдоль
+    самой кромки показывает, докуда оно идёт, и вершина уезжает за кадр --
+    как и должно быть.
+
+    Внутри кадра поведение совпадает с _find_mask_boundary_along точка в
+    точку: там проекция равна самой точке.
+    """
+    h, w = mask.shape[:2]
+    sx, sy = float(start_point[0]), float(start_point[1])
+    X = np.array([sx, sy], dtype=np.float64)
+    ix, iy = int(round(sx)), int(round(sy))
+    if not (0 <= ix < w and 0 <= iy < h) or mask[iy, ix] == 0:
+        return X                      # старт вне маски -- идти неоткуда
+    dist = 0.0
+    while dist < max_dist:
+        dist += 1.0
+        point = np.array([sx, sy], dtype=np.float64) + dist * direction
+        px = min(max(int(round(point[0])), 0), w - 1)
+        py = min(max(int(round(point[1])), 0), h - 1)
+        if mask[py, px] == 0:
+            break
+        X = point
+    return X
+
+
 def _ray_to_mask_edge(mask, start_point, direction, max_dist):
     """Длина луча от start_point до границы маски и чем он остановлен.
 
@@ -256,19 +290,56 @@ def _find_clothing_bottom(mask, pose_landmarks, region, frame_w, frame_h, S, y_h
 
 
 
-def _head_corners(nose, e1, e2, right, left, up, down):
+def _head_top_along(mask, anchor, e1, e2, half_width, max_dist, step=1.0):
+    """Расстояние от anchor до макушки вдоль e2.
+
+    Полоса шириной 2*half_width поперёк e2 сканируется снизу вверх; макушка --
+    последний уровень, на котором в полосе ещё есть маска. Пустой уровень
+    останавливает поиск, поэтому поднятая рука над головой (её отделяет
+    просвет фона) в замер не попадает.
+
+    Один луч тут не годится: если пускать его от носа, то в профиль нос стоит
+    на переднем краю головы и луч выходит через лоб, не доходя до макушки --
+    на my.mp4 это до 0.26 ширины плеч недобора. Полоса ловит макушку при
+    любом ракурсе.
+    """
+    h, w = mask.shape[:2]
+    n_lat = max(3, int(round(half_width)))      # узлы примерно через 2 px
+    lat = np.linspace(-half_width, half_width, n_lat).reshape(-1, 1)
+    top = 0.0
+    dist = 0.0
+    while dist < max_dist:
+        dist += step
+        pts = anchor + dist * e2 + lat * e1
+        ix = np.rint(pts[:, 0]).astype(np.int64)
+        iy = np.rint(pts[:, 1]).astype(np.int64)
+        inside = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
+        if not inside.any():
+            break
+        if not (mask[iy[inside], ix[inside]] > 0).any():
+            break
+        top = dist
+    return top
+
+
+def _head_corners(anchor, e1, e2, right, left, up, down):
     """Углы прямоугольника головы в том же порядке, что и в calibrate_head.
 
     [верхний правый, верхний левый, нижний левый, нижний правый].
-    Все четыре размера -- расстояния ОТ НОСА: right вдоль +e1, left вдоль -e1,
-    up вдоль +e2, down вдоль -e2. Прямоугольник не обязан быть симметричным
-    относительно носа: при повороте головы нос смещён с середины линии ушей.
+    Все четыре размера -- расстояния ОТ ОПОРНОЙ ТОЧКИ: right вдоль +e1,
+    left вдоль -e1, up вдоль +e2, down вдоль -e2. Прямоугольник не обязан быть
+    симметричным относительно неё.
+
+    Внутри калибровки опорная точка -- нос (так замеряются все расстояния по
+    маске). Наружу, в calibration_params.json, те же размеры пересчитываются
+    от середины отрезка ушей: нос при повороте головы уезжает с черепа, и
+    прямоугольник, привязанный к нему, ползёт по кадру при неподвижной голове.
     """
     return np.array([
-        nose + right * e1 + up * e2,
-        nose - left * e1 + up * e2,
-        nose - left * e1 - down * e2,
-        nose + right * e1 - down * e2,
+        anchor + right * e1 + up * e2,
+        anchor - left * e1 + up * e2,
+        anchor - left * e1 - down * e2,
+        anchor + right * e1 - down * e2,
     ], dtype=np.float64)
 
 
@@ -467,23 +538,20 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h,
     left_dist = float(np.dot(nose - left_boundary, e1))
     head_width = right_dist + left_dist
 
-    # Идём от носа вверх (вдоль e2) до границы маски -> макушка
-    step = 1.0
-    dist = 0.0
-    max_dist = float(max(frame_w, frame_h))
-    X = nose.copy()
-    while dist < max_dist:
-        dist += step
-        point = nose + dist * e2
-        px = int(round(point[0]))
-        py = int(round(point[1]))
-        if px < 0 or px >= frame_w or py < 0 or py >= frame_h:
-            break
-        if mask[py, px] == 0:
-            break
-        X = point.copy()
+    # Опорная точка прямоугольника -- середина отрезка ушей. Нос при повороте
+    # головы уезжает с черепа, поэтому наружу (в JSON и в замер макушки) идут
+    # расстояния от неё, а не от носа.
+    ear_mid = (ear_l + ear_r) / 2.0
+    m1 = float(np.dot(ear_mid - nose, e1))
+    m2 = float(np.dot(ear_mid - nose, e2))
 
-    len_XN = float(np.linalg.norm(X - nose))
+    # Макушка: полоса шириной с голову, от середины ушей вверх вдоль e2.
+    up_from_anchor = _head_top_along(mask, ear_mid, e1, e2, head_width / 2.0,
+                                     float(max(frame_w, frame_h)))
+    # Внутри калибровки всё считается от носа (так меряются низ и шея),
+    # поэтому замер переводится в ту же систему.
+    len_XN = up_from_anchor + m2
+    X = nose + len_XN * e2
 
     # Ограничение len(XN) (защита от слишком большой верхней границы)
     if config.CALIBRATION_EAR_EXTEND_COEF is not None:
@@ -536,8 +604,31 @@ def calibrate_head(mask, pose_landmarks, region, frame_w, frame_h,
     corners = _head_corners(nose, e1, e2, right_dist, left_dist,
                             len_XN, down_dist)
 
+    # Опорная точка для трекинга -- середина отрезка ушей, а не нос. Нос
+    # вынесен вперёд от оси вращения головы, поэтому при повороте его проекция
+    # уезжает на величину порядка выноса, и прямоугольник плывёт по кадру при
+    # неподвижной голове. Середина 7-8 лежит почти на оси вращения.
+    # Сам прямоугольник от этого не меняется: те же четыре угла, просто
+    # размеры пересчитаны от другой точки.
+    # Тот же вектор в долях ширины плеч -- метка ракурса на кадре калибровки.
+    # Трекинг сравнивает с ней свою и по разнице правит размеры головы
+    # (config.HEAD_VIEW_COMP).
+    nose_a = m1 / S if S > 1e-6 else 0.0
+    nose_b = m2 / S if S > 1e-6 else 0.0
+    anchor_right = right_dist - m1
+    anchor_left = left_dist + m1
+    anchor_up = len_XN - m2
+    anchor_down = down_dist + m2
+
     return {
         'center': nose,
+        'anchor': ear_mid,
+        'anchor_right': anchor_right,
+        'anchor_left': anchor_left,
+        'anchor_up': anchor_up,
+        'anchor_down': anchor_down,
+        'nose_a': nose_a,
+        'nose_b': nose_b,
         'width': head_width,
         'height': head_height,
         'e1': e1,
@@ -962,11 +1053,13 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
     spread_11 = _arm_spread(sh_l, elbow_l, u_shoulder)     # угол при 11: 11->12 и 11->13
     spread_12 = _arm_spread(sh_r, elbow_r, -u_shoulder)    # угол при 12: 12->11 и 12->14
 
+    # Луч продолжается за кадром, если упёрся в рамку: см.
+    # _find_mask_boundary_beyond_frame.
     tl_by_ray = tr_by_ray = True
-    TL = _find_mask_boundary_along(mask, sh_r, _ray_dir(-u_shoulder),
-                                   max_extend_shoulder)
-    TR = _find_mask_boundary_along(mask, sh_l, _ray_dir(u_shoulder),
-                                   max_extend_shoulder)
+    TL = _find_mask_boundary_beyond_frame(mask, sh_r, _ray_dir(-u_shoulder),
+                                          max_extend_shoulder)
+    TR = _find_mask_boundary_beyond_frame(mask, sh_l, _ray_dir(u_shoulder),
+                                          max_extend_shoulder)
 
     # Нижние вершины (BL, BR).
     #
@@ -1400,13 +1493,21 @@ def save_calibration_params(filepath, head_result, torso_result,
             'S': float(S),
             'k_hw': float(head_result['k_hw']),
             'k_hh': float(head_result['k_hh']),
+            # Опорная точка прямоугольника: 'ear_mid' -- середина отрезка
+            # ушей 7-8. Ключ читает трекинг; без него (старый файл) размеры
+            # отсчитываются от носа, как раньше.
+            'anchor': 'ear_mid',
+            # Ракурс на кадре калибровки: вектор нос -> середина ушей,
+            # разложенный по осям прямоугольника, в долях ширины плеч.
+            'nose_a_coef': float(head_result['nose_a']),
+            'nose_b_coef': float(head_result['nose_b']),
             # width_coef оставлен для старых потребителей: полная ширина.
-            # Форму задают четыре расстояния от носа -- right/left/up/down.
+            # Форму задают четыре расстояния от опорной точки.
             'width_coef': float(head_result['width'] / S) if S > 1e-6 else 0.0,
-            'right_coef': float(head_result['right_dist'] / S) if S > 1e-6 else 0.0,
-            'left_coef': float(head_result['left_dist'] / S) if S > 1e-6 else 0.0,
-            'up_coef': float(head_result['len_XN'] / S) if S > 1e-6 else 0.0,
-            'down_coef': float(head_result['down_dist'] / S) if S > 1e-6 else 0.0,
+            'right_coef': float(head_result['anchor_right'] / S) if S > 1e-6 else 0.0,
+            'left_coef': float(head_result['anchor_left'] / S) if S > 1e-6 else 0.0,
+            'up_coef': float(head_result['anchor_up'] / S) if S > 1e-6 else 0.0,
+            'down_coef': float(head_result['anchor_down'] / S) if S > 1e-6 else 0.0,
         }
 
     if torso_result is not None:

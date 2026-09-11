@@ -19,6 +19,9 @@ def build_head_rect_from_params(params, pose_landmarks, region, frame_w, frame_h
 
     params - dict с ключами 'width_coef', 'up_coef', 'down_coef'
              (нормализованные коэффициенты из calibrate_head).
+             params['anchor'] == 'ear_mid' -- размеры отсчитываются от
+             середины отрезка ушей 7-8; без этого ключа (файл старой
+             калибровки) -- от носа, как было раньше.
     pose_landmarks - точки позы текущего кадра (список NormalizedLandmark).
     region - (ox, oy, rw, rh) кроп или None (полный кадр).
     frame_w, frame_h - размеры кадра.
@@ -34,11 +37,22 @@ def build_head_rect_from_params(params, pose_landmarks, region, frame_w, frame_h
     sh_l = _get_point_px(pose_landmarks, LEFT_SHOULDER, region, frame_w, frame_h)
     sh_r = _get_point_px(pose_landmarks, RIGHT_SHOULDER, region, frame_w, frame_h)
 
-    if nose is None or ear_l is None or ear_r is None:
+    if ear_l is None or ear_r is None:
         return None
 
     ear_dist = float(np.linalg.norm(ear_r - ear_l))
     if ear_dist < 1e-6:
+        return None
+
+    # Опорная точка. Нос торчит вперёд от оси вращения головы: при повороте
+    # его проекция уезжает по кадру, хотя голова стоит на месте, и вместе с
+    # ней уезжает весь прямоугольник. Середина отрезка ушей лежит почти на
+    # оси вращения и держится вдвое стабильнее.
+    if params.get('anchor') == 'ear_mid':
+        anchor = (ear_l + ear_r) / 2.0
+    elif nose is not None:
+        anchor = nose                 # старый файл калибровки
+    else:
         return None
 
     # Направление вдоль линии ушей
@@ -49,7 +63,7 @@ def build_head_rect_from_params(params, pose_landmarks, region, frame_w, frame_h
     # Направление "вверх" (к макушке) и ширина плеч
     if sh_l is not None and sh_r is not None:
         shoulder_mid = (sh_l + sh_r) / 2.0
-        v = nose - shoulder_mid
+        v = anchor - shoulder_mid
         if np.dot(v, e2) < 0:
             e2 = -e2  # e2 теперь направлен к макушке
         S_cur = float(np.linalg.norm(sh_r - sh_l))
@@ -69,17 +83,39 @@ def build_head_rect_from_params(params, pose_landmarks, region, frame_w, frame_h
     else:
         right = left = params['width_coef'] * S_cur / 2.0
 
+    # Поправка на ракурс: голова на кадре повёрнута/наклонена не так, как на
+    # кадре калибровки, и в проекции её размеры другие. Величина ракурса
+    # читается с вектора нос -> середина ушей (нос вынесен вперёд от оси
+    # вращения), в долях ширины плеч; работает разница с калибровкой.
+    if (config.HEAD_VIEW_COMP_ENABLED and nose is not None
+            and 'nose_a_coef' in params and S_cur > 1e-6):
+        d_nose = anchor - nose
+        # У компоненты вдоль ушей берётся модуль: поворот в любую сторону
+        # укорачивает проекцию головы одинаково (см. config.HEAD_VIEW_COMP).
+        da = (abs(float(np.dot(d_nose, e1)) / S_cur)
+              - abs(params['nose_a_coef']))
+        db = float(np.dot(d_nose, e2)) / S_cur - params['nose_b_coef']
+        floor = config.HEAD_VIEW_COMP_MIN_COEF * S_cur
+        comp = config.HEAD_VIEW_COMP
+        right = max(floor, right + (comp['right'][0] * da
+                                    + comp['right'][1] * db) * S_cur)
+        left = max(floor, left + (comp['left'][0] * da
+                                  + comp['left'][1] * db) * S_cur)
+        up = max(floor, up + (comp['up'][0] * da + comp['up'][1] * db) * S_cur)
+        down = max(floor, down + (comp['down'][0] * da
+                                  + comp['down'][1] * db) * S_cur)
+
     # Тот же фолбэк, что и при калибровке: низ головы не уходит ниже линии
     # плеч. На кадре поза может измениться так, что запомненный down_coef
     # опустит границу в грудь.
-    down = clamp_head_down_to_shoulders(nose, e1, e2, right, left, down,
+    down = clamp_head_down_to_shoulders(anchor, e1, e2, right, left, down,
                                         sh_l, sh_r)
 
     corners = np.array([
-        nose + right * e1 + up * e2,      # верхний правый
-        nose - left * e1 + up * e2,       # верхний левый
-        nose - left * e1 - down * e2,     # нижний левый
-        nose + right * e1 - down * e2,    # нижний правый
+        anchor + right * e1 + up * e2,      # верхний правый
+        anchor - left * e1 + up * e2,       # верхний левый
+        anchor - left * e1 - down * e2,     # нижний левый
+        anchor + right * e1 - down * e2,    # нижний правый
     ], dtype=np.float64)
     return corners
 
