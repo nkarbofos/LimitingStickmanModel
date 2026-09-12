@@ -16,15 +16,16 @@ from .head_constraint import (compute_head_ellipse_from_pose,
                               apply_head_ellipse_constraint,
                               draw_head_ellipse_arc)
 from .visualization import (category_mask_to_colored, confidence_masks_to_heatmap,
-                            draw_pose_landmarks, draw_face_oval, compute_face_oval_size, 
-                            fill_poly_with_alpha)
+                            draw_pose_landmarks, draw_face_oval, compute_face_oval_size,
+                            draw_neck_points, fill_poly_with_alpha)
 from .stats import print_latency_stats
 from .download import ensure_models
 from .stickman_model import (build_stickman_mask, overlay_stickman,
                              build_body_rects)
 from .calibration import load_calibration_params
 from .tracking import (build_head_rect_from_params, build_torso_quad_from_params,
-                       build_neck_quad_from_torso_and_head,
+                       build_neck_quad_from_torso_and_head, build_neck_base_quad,
+                       build_neck_top_quad,
                        build_shoulders_bottom_quads, build_lower_neck_quad)
 from .stickman_model import LEFT_SHOULDER, RIGHT_SHOULDER, _get_point_px
 from .calibration import LEFT_HIP, RIGHT_HIP
@@ -330,9 +331,20 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
 
             # Шея: нужна и маске stickman, и блоку отслеживания ниже.
             tracked_neck_quad = None
+            tracked_neck_base = None
+            tracked_neck_top = None
             if tracked_head_corners is not None and tracked_torso_quad is not None:
+                _nlm = pose_result.pose_landmarks[0]
                 tracked_neck_quad = build_neck_quad_from_torso_and_head(
-                    tracked_torso_quad, tracked_head_corners, calib_neck)
+                    tracked_torso_quad, tracked_head_corners, calib_neck,
+                    sh_l=_get_point_px(_nlm, LEFT_SHOULDER, region, width, height),
+                    sh_r=_get_point_px(_nlm, RIGHT_SHOULDER, region, width, height))
+                _nsl = _get_point_px(_nlm, LEFT_SHOULDER, region, width, height)
+                _nsr = _get_point_px(_nlm, RIGHT_SHOULDER, region, width, height)
+                tracked_neck_base = build_neck_base_quad(
+                    calib_neck, tracked_head_corners, sh_l=_nsl, sh_r=_nsr)
+                tracked_neck_top = build_neck_top_quad(
+                    calib_neck, tracked_head_corners, sh_l=_nsl, sh_r=_nsr)
 
             # Фигуры "плечи-низ": есть только у калибровок с половинного
             # кадра без бёдер (целиком либо половинками по невидимой руке).
@@ -364,7 +376,10 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                     neck_quad=tracked_neck_quad,
                     shoulders_bottom_quads=tracked_shoulders_bottom,
                     lower_neck_quad=tracked_lower_neck,
-                    limb_grow=(calib_params or {}).get('limb_grow'))
+                    limb_grow=(calib_params or {}).get('limb_grow'),
+                    neck_base_quad=tracked_neck_base,
+                    neck_top_quad=tracked_neck_top,
+                    thigh_mode=(calib_params or {}).get('thigh_quad_mode'))
                 if stickman_mask is not None:
                     overlay = overlay_stickman(
                         overlay, stickman_mask,
@@ -401,6 +416,10 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                 for enabled, poly, color in (
                         (config.DRAW_TRACKED_TORSO, torso_quad, config.TRACKED_TORSO_COLOR),
                         (config.DRAW_TRACKED_NECK, neck_quad, config.TRACKED_NECK_COLOR),
+                        (config.DRAW_TRACKED_NECK, tracked_neck_base,
+                         config.CALIB_NECK_BASE_COLOR),
+                        (config.DRAW_TRACKED_NECK, tracked_neck_top,
+                         config.CALIB_NECK_TOP_COLOR),
                         (config.DRAW_TRACKED_HEAD, head_corners, config.TRACKED_HEAD_COLOR)):
                     if not enabled or poly is None:
                         continue
@@ -410,6 +429,16 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                     cv2.polylines(overlay, [np.asarray(poly, dtype=np.int32)],
                                   isClosed=True, color=color,
                                   thickness=config.TRACKED_THICKNESS)
+
+                # Отладка шеи: её вершины и опорные точки поверх всего.
+                if config.DRAW_NECK_POINTS:
+                    _dlm = pose_result.pose_landmarks[0]
+                    draw_neck_points(
+                        overlay, neck_quad, head_corners, torso_quad,
+                        sh_l=_get_point_px(_dlm, LEFT_SHOULDER, region,
+                                           width, height),
+                        sh_r=_get_point_px(_dlm, RIGHT_SHOULDER, region,
+                                           width, height))
 
                 # Ладони и ступни: строятся прямо из точек позы, калибровка
                 # для них не нужна (ширина -- доля от плеч / таза).

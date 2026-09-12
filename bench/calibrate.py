@@ -36,13 +36,17 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 from . import config
-from .calibration import (calibrate_head, calibrate_torso,
+from .calibration import (widen_head_rect, widen_polygon,
+                          calibrate_head, calibrate_torso,
                           calibrate_limb_widths, calibrate_neck,
                           calibrate_lower_neck, save_calibration_params)
 from .download import ensure_models
 from .stickman_model import (build_body_rects, build_thigh_quads,
-                             build_arm_shoulder_tris)
-from .tracking import build_neck_quad_from_torso_and_head
+                             build_arm_shoulder_tris, choose_thigh_quad_mode,
+                             build_legs_below_frame_quad,
+                             _get_point_px, LEFT_SHOULDER, RIGHT_SHOULDER)
+from .tracking import (build_neck_quad_from_torso_and_head,
+                       build_neck_base_quad, build_neck_top_quad)
 from .visualization import draw_pose_landmarks
 
 
@@ -55,6 +59,8 @@ _RECT_GROUPS = (
     ('palms', 'ладони',  'CALIB_PALM_COLOR'),
     ('feet',  'ступни',  'CALIB_FOOT_COLOR'),
     ('thigh_quads', 'четыр. бёдер', 'CALIB_THIGH_QUAD_COLOR'),
+    ('thigh_rects', 'прямоуг. бёдер', 'CALIB_THIGH_RECT_COLOR'),
+    ('legs_below', 'ноги за кадр', 'CALIB_LEGS_BELOW_COLOR'),
     ('arm_tops_quad', 'четыр. ABCD', 'CALIB_ARM_TOPS_COLOR'),
     ('arm_tris', 'треуг. плеча', 'CALIB_ARM_TRI_COLOR'),
     ('joint_tris', 'треуг. суставов', 'CALIB_JOINT_TRI_COLOR'),
@@ -374,11 +380,22 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
 
     # Четырёхугольники верха ног: строятся только после торса -- им нужны
     # его нижние вершины BL и BR.
+    thigh_mode = None
     if body_rects is not None:
+        thigh_mode, thigh_why = choose_thigh_quad_mode(
+            mask_full, pose_landmarks, region, frame_w, frame_h,
+            torso_result['quad'] if torso_result is not None else None,
+            limb_widths=limb_widths, limb_grow=limb_grow)
+        print(f"Верх ног: режим {thigh_mode} ({thigh_why})")
+        body_rects['legs_below'] = [
+            q.astype(np.int32) for q in [build_legs_below_frame_quad(
+                pose_landmarks, region, frame_w, frame_h,
+                torso_result['quad'] if torso_result is not None else None)]
+            if q is not None]
         body_rects['thigh_quads'] = build_thigh_quads(
             pose_landmarks, region, frame_w, frame_h,
             torso_result['quad'] if torso_result is not None else None,
-            limb_widths=limb_widths)
+            limb_widths=limb_widths, mode=thigh_mode)
         # Треугольники плеча: тоже нужны вершины торса
         body_rects['arm_tris'] = build_arm_shoulder_tris(
             pose_landmarks, region, frame_w, frame_h,
@@ -429,10 +446,17 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
             mask_full, head_result['corners'], frame_w, frame_h)
 
     # Профиль шеи считается последним: ему нужны и готовая голова, и торс.
+    # Плечи и овал лица нужны обходу по маске: первое задаёт систему
+    # координат профиля, второе -- где обход останавливается.
+    neck_sh_l = _get_point_px(pose_landmarks, LEFT_SHOULDER, region,
+                              frame_w, frame_h)
+    neck_sh_r = _get_point_px(pose_landmarks, RIGHT_SHOULDER, region,
+                              frame_w, frame_h)
     neck_result = calibrate_neck(
         mask_full,
         head_result['corners'] if head_result is not None else None,
-        torso_result['quad'] if torso_result is not None else None)
+        torso_result['quad'] if torso_result is not None else None,
+        sh_l=neck_sh_l, sh_r=neck_sh_r, face_oval=face_oval)
     print_neck_profile(neck_result)
 
     if limb_grow:
@@ -580,7 +604,7 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
                             limb_widths=limb_widths, neck_result=neck_result,
                             video_path=video_path, frame_index=frame_index,
                             lower_neck_result=lower_neck_result,
-                            limb_grow=limb_grow)
+                            limb_grow=limb_grow, thigh_mode=thigh_mode)
 
     # Визуализация на полном кадре
     overlay = frame_bgr.copy()
@@ -599,6 +623,19 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     # Голова
     if head_result is not None:
         corners_full = head_result['corners'].astype(np.int32)
+        # Временное расширение прямоугольника головы: по нему останавливался
+        # обход шеи. Наружу оно не идёт -- ни в маску модели, ни в трекинг;
+        # здесь рисуется только чтобы было видно, обо что упёрлись L0 и R0.
+        if config.CALIBRATION_NECK_HEAD_WIDEN_COEF:
+            wide = widen_head_rect(head_result['corners'],
+                                   config.CALIBRATION_NECK_HEAD_WIDEN_COEF)
+            cv2.polylines(overlay, [wide.astype(np.int32)], isClosed=True,
+                          color=config.CALIB_HEAD_WIDE_COLOR, thickness=2)
+        if face_oval is not None and config.CALIBRATION_NECK_OVAL_WIDEN_COEF:
+            wide_oval = widen_polygon(face_oval,
+                                      config.CALIBRATION_NECK_OVAL_WIDEN_COEF)
+            cv2.polylines(overlay, [wide_oval.astype(np.int32)], isClosed=True,
+                          color=config.CALIB_HEAD_WIDE_COLOR, thickness=2)
         cv2.polylines(overlay, [corners_full], isClosed=True,
                       color=(0, 200, 255), thickness=2)
 
@@ -636,7 +673,24 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     # отношения не имеет.
     if head_result is not None and torso_result is not None:
         neck_quad = build_neck_quad_from_torso_and_head(
-            torso_result['quad'], head_result['corners'], neck_result)
+            torso_result['quad'], head_result['corners'], neck_result,
+            sh_l=neck_sh_l, sh_r=neck_sh_r)
+        neck_base = build_neck_base_quad(
+            neck_result, head_result['corners'],
+            sh_l=neck_sh_l, sh_r=neck_sh_r)
+        if neck_base is not None:
+            cv2.polylines(overlay, [neck_base.astype(np.int32)],
+                          isClosed=True,
+                          color=config.CALIB_NECK_BASE_COLOR,
+                          thickness=config.TRACKED_THICKNESS + 1)
+        neck_top = build_neck_top_quad(
+            neck_result, head_result['corners'],
+            sh_l=neck_sh_l, sh_r=neck_sh_r)
+        if neck_top is not None:
+            cv2.polylines(overlay, [neck_top.astype(np.int32)],
+                          isClosed=True,
+                          color=config.CALIB_NECK_TOP_COLOR,
+                          thickness=config.TRACKED_THICKNESS + 1)
         if neck_quad is not None:
             cv2.polylines(overlay, [neck_quad.astype(np.int32)],
                           isClosed=True,

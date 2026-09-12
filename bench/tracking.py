@@ -4,6 +4,7 @@
 и откалиброванным параметрам (нормализованным коэффициентам).
 """
 
+import cv2
 import numpy as np
 
 from . import config
@@ -352,8 +353,143 @@ def neck_sides(torso_quad, head_corners):
            (head[2], np.asarray(TR, dtype=np.float64))
 
 
+def neck_frame(sh_l, sh_r, head_corners):
+    """Система координат шеи: середина 11-12, оси вдоль плеч и к голове.
+
+    Возвращает (sh_mid, u, n, S) либо None. В ней записан обведённый по маске
+    профиль шеи, в ней же он и восстанавливается на кадре.
+    """
+    sh_l = np.asarray(sh_l, dtype=np.float64)
+    sh_r = np.asarray(sh_r, dtype=np.float64)
+    S = float(np.linalg.norm(sh_r - sh_l))
+    if S < 1e-6:
+        return None
+    u = (sh_r - sh_l) / S
+    n = _rotate90(u)
+    sh_mid = (sh_l + sh_r) / 2.0
+    head = np.asarray(head_corners, dtype=np.float64)
+    if float(np.dot(head.mean(axis=0) - sh_mid, n)) < 0:
+        n = -n                      # нормаль смотрит от плеч к голове
+    return sh_mid, u, n, S
+
+
+_NECK_TRACE_KEYS = ('left_u', 'left_n', 'right_u', 'right_n')
+
+
+def _neck_quad_traced(neck_params, head_corners, sh_l, sh_r):
+    """Шея по обведённому профилю: точки записаны в системе координат плеч.
+
+    Профиль снят обходом границы маски от верхних вершин торса вверх до
+    головы, поэтому прямой трапецией он не описывается: стороны идут по скату
+    плеча, а не по хорде от угла головы к углу торса.
+
+    Возвращает контур либо None.
+    """
+    cols = [neck_params.get(k) for k in _NECK_TRACE_KEYS]
+    if any(not c for c in cols):
+        return None
+    lu, ln, ru, rn = cols
+    if not (len(lu) == len(ln) == len(ru) == len(rn)) or len(lu) < 2:
+        return None
+    frame = neck_frame(sh_l, sh_r, head_corners)
+    if frame is None:
+        return None
+    sh_mid, u, nrm, S = frame
+    left = [sh_mid + S * (lu[i] * u + ln[i] * nrm) for i in range(len(lu))]
+    right = [sh_mid + S * (ru[i] * u + rn[i] * nrm) for i in range(len(ru))]
+    poly = np.array(left + right[::-1], dtype=np.float64)
+    return None if polygon_self_intersects(poly) else poly
+
+
+def _simple_quad(points):
+    """Простой контур по четырём точкам.
+
+    Обычно порядок точек уже даёт несамопересекающийся контур. Но стороны
+    могут перехлестнуться: например у верха шеи -- когда L0 ушёл под нижнее
+    ребро головы (оказался внутри прямоугольника), а R0 остался снаружи,
+    верхнее ребро пересекает нижнее. Фигуру в таком случае не отбрасываем, а
+    обходим по выпуклой оболочке: она покрывает ту же полосу и всегда простая.
+    """
+    quad = np.asarray(points, dtype=np.float64)
+    if not polygon_self_intersects(quad):
+        return quad
+    hull = cv2.convexHull(quad.astype(np.float32)).reshape(-1, 2)
+    return hull.astype(np.float64) if len(hull) >= 3 else None
+
+
+_NECK_BASE_KEYS = ('base_l_u', 'base_l_n', 'base_r_u', 'base_r_n')
+
+
+def build_neck_base_quad(neck_params, head_corners, sh_l=None, sh_r=None):
+    """Основание шеи: полоса между уровнями нижних точек её сторон.
+
+    Стороны шеи заканчиваются на разной высоте -- каждая там, где вошла в
+    фигуру торса. Полосу между их уровнями не закрывает ни шея, ни торс.
+    Четырёхугольник строится по четырём точкам: нижние точки обеих сторон и
+    две точки, куда упёрлись линии, проведённые от них вдоль плеч к
+    противоположной стороне (при калибровке -- до границы маски).
+
+    Возвращает контур (4, 2) либо None.
+    """
+    if not neck_params or sh_l is None or sh_r is None:
+        return None
+    if any(k not in neck_params for k in _NECK_BASE_KEYS):
+        return None
+    lu, ln = neck_params.get('left_u'), neck_params.get('left_n')
+    ru, rn = neck_params.get('right_u'), neck_params.get('right_n')
+    if not lu or not ru:
+        return None
+    frame = neck_frame(sh_l, sh_r, head_corners)
+    if frame is None:
+        return None
+    sh_mid, u, nrm, S = frame
+    at = lambda a, b: sh_mid + S * (a * u + b * nrm)
+    return _simple_quad([
+        at(lu[-1], ln[-1]),                                   # низ стороны L
+        at(neck_params['base_l_u'], neck_params['base_l_n']),  # от L вправо
+        at(ru[-1], rn[-1]),                                   # низ стороны R
+        at(neck_params['base_r_u'], neck_params['base_r_n']),  # от R влево
+    ])
+
+
+def build_neck_top_quad(neck_params, head_corners, sh_l=None, sh_r=None):
+    """Верх шеи: полоса между её верхним ребром и нижним ребром головы.
+
+    L0 и R0 стоят там, где обход силуэта вошёл в голову (по овалу лица), а
+    нижнее ребро прямоугольника головы проходит ниже -- полоса между ними не
+    закрыта ни шеей, ни торсом. Две другие вершины берутся на самом ребре
+    головы, на откалиброванных долях от его середины: там ребро выходило из
+    маски (или, если конец ребра сам был в маске, это его конец).
+
+    Возвращает контур (4, 2) либо None.
+    """
+    if not neck_params or head_corners is None:
+        return None
+    if 'head_l_t' not in neck_params or 'head_r_t' not in neck_params:
+        return None
+    lu, ln = neck_params.get('left_u'), neck_params.get('left_n')
+    ru, rn = neck_params.get('right_u'), neck_params.get('right_n')
+    if not lu or not ru:
+        return None
+    frame = neck_frame(sh_l, sh_r, head_corners)
+    if frame is None:
+        return None
+    sh_mid, u, nrm, S = frame
+    head = np.asarray(head_corners, dtype=np.float64)
+    if head.shape[0] < 4:
+        return None
+    mid = (head[3] + head[2]) / 2.0
+    return _simple_quad([
+        sh_mid + S * (lu[0] * u + ln[0] * nrm),           # L0
+        sh_mid + S * (ru[0] * u + rn[0] * nrm),           # R0
+        mid + float(neck_params['head_r_t']) * (head[2] - mid),
+        mid + float(neck_params['head_l_t']) * (head[3] - mid),
+    ])
+
+
 def build_neck_quad_from_torso_and_head(torso_quad, head_corners,
-                                        neck_params=None):
+                                        neck_params=None,
+                                        sh_l=None, sh_r=None):
     """Строит шею между верхом торса и низом головы.
 
     torso_quad   - контур торса; берутся вершины TL и TR.
@@ -374,6 +510,13 @@ def build_neck_quad_from_torso_and_head(torso_quad, head_corners,
     Масштаб не нужен: доли берутся от самой трапеции, а она уже построена по
     откалиброванным голове и торсу.
     """
+    # Обведённый по маске профиль, если он есть в калибровке.
+    if neck_params and sh_l is not None and sh_r is not None \
+            and head_corners is not None:
+        poly = _neck_quad_traced(neck_params, head_corners, sh_l, sh_r)
+        if poly is not None:
+            return poly
+
     sides = neck_sides(torso_quad, head_corners)
     if sides is None:
         return None

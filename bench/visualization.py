@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 from . import config
+from .stickman_model import torso_vertex
 
 
 def region_or_full(region, frame):
@@ -89,6 +90,52 @@ def compute_face_oval_size(face_landmarks, rw, rh):
     xs = [landmarks[i].x * rw for i in config.FACE_OVAL]
     ys = [landmarks[i].y * rh for i in config.FACE_OVAL]
     return (max(xs) - min(xs)), (max(ys) - min(ys))
+
+
+def draw_neck_points(frame, neck_quad, head_corners, torso_quad,
+                     sh_l=None, sh_r=None):
+    """Вершины фигуры шеи и опорные точки, по которым она строится.
+
+    Включается config.DRAW_NECK_POINTS. Контур шеи собран как левая сторона
+    от головы к торсу, затем правая от торса к голове, поэтому уровень j --
+    это neck_quad[j] слева и neck_quad[2k-1-j] справа, где k -- половина
+    длины контура.
+    """
+    def dot(p, color, label):
+        if p is None:
+            return
+        q = np.asarray(p, dtype=np.float64)
+        if q.shape != (2,) or not np.all(np.isfinite(q)):
+            return
+        c = (int(round(q[0])), int(round(q[1])))
+        cv2.circle(frame, c, config.NECK_POINT_RADIUS, color, -1)
+        cv2.circle(frame, c, config.NECK_POINT_RADIUS + 2, (0, 0, 0), 1)
+        if config.NECK_POINT_LABELS and label:
+            cv2.putText(frame, label, (c[0] + 7, c[1] - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+    if neck_quad is not None:
+        q = np.asarray(neck_quad, dtype=np.float64)
+        k = len(q) // 2
+        for j in range(k):
+            dot(q[j], config.NECK_POINT_COLOR, 'L%d' % j)
+            dot(q[len(q) - 1 - j], config.NECK_POINT_COLOR, 'R%d' % j)
+
+    if head_corners is not None:
+        h = np.asarray(head_corners, dtype=np.float64)
+        if len(h) >= 4:
+            dot(h[3], config.NECK_REF_COLOR, 'H3')
+            dot(h[2], config.NECK_REF_COLOR, 'H2')
+    if torso_quad is not None:
+        for name in ('TL', 'TR'):
+            dot(torso_vertex(torso_quad, name), config.NECK_REF_COLOR, name)
+    if sh_l is not None and sh_r is not None:
+        a = np.asarray(sh_l, dtype=np.float64)
+        b = np.asarray(sh_r, dtype=np.float64)
+        dot(a, config.NECK_REF_COLOR, '11')
+        dot(b, config.NECK_REF_COLOR, '12')
+        dot((a + b) / 2.0, config.NECK_REF_COLOR, 'C')
+    return frame
 
 
 def fill_poly_with_alpha(frame, polygon, color, alpha):
