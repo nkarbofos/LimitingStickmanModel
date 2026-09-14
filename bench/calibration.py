@@ -24,7 +24,7 @@ from .stickman_model import (
 )
 # tracking тянет только stickman_model, цикла импорта не возникает
 from .tracking import (build_neck_quad_from_torso_and_head, neck_frame,
-                       neck_sides)
+                       neck_sides, shoulder_hip_angle_deg)
 
 # Индексы точек позы для ног
 LEFT_HIP = 23
@@ -1298,11 +1298,9 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
       торса; концы найдены вытягиванием от её середины наружу до границы
       маски. Выключается флагом CALIBRATION_BELLY_ENABLED.
 
-    limb_rects -- четырёхугольники рук и ног. Если луч из середины линии
-    живота до границы маски (уже БЕЗ ограничения CALIBRATION_BELLY_EXTEND_COEF)
-    задевает такую фигуру, линия живота не строится: сбоку от корпуса на этом
-    уровне стоит конечность, и линия ушла бы в неё вместо бока. Тогда торс
-    остаётся четырёхугольником плечи-торс. None -- проверка не делается.
+    limb_rects -- фигуры рук и ног (предплечья, ладони, голени,
+    прямоугольники бёдер). Если отрезок линии живота ML-MR касается хотя бы
+    одной из них, линия не строится и торс остаётся четырёхугольником.
 
     Возвращает dict с параметрами торса или None (если плечи не видны).
     Ключ 'quad' -- ШЕСТИугольник [TL, TR, MR, BR, BL, ML].
@@ -1518,11 +1516,11 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
                  [x_out, y_bottom_q], A], dtype=np.float64)
 
     # --- Линия живота ---------------------------------------------------
-    # Параллельна линии плеч, отстоит от неё на CALIBRATION_BELLY_COEF среднего
-    # ПЕРПЕНДИКУЛЯРНОГО расстояния до линии торса. Требования "2/3 расстояния" и
-    # "параллельно плечам" совместимы только для трапеции, а торс ей не является
-    # (на развёрнутом корпусе линии плеч и торса расходятся на десятки градусов),
-    # поэтому смещение задаётся именно по нормали, а не вдоль боковых рёбер.
+    # Параллельна линии плеч и проходит через середину отрезка AB: A --
+    # середина плеч 11-12, B -- середина таза 23-24. Точка берётся по самим
+    # точкам позы, а не по вершинам торса, -- так же её строит трекинг
+    # (tracking.build_torso_quad_from_params), и положение линии на кадре
+    # не зависит от того, как калибровка подогнала TL/TR и BL/BR.
     # Концы ML/MR ищутся вытягиванием от середины линии наружу до границы
     # маски (почему от середины, а не от плеч -- см. ниже).
     # Выключается флагом CALIBRATION_BELLY_ENABLED: тогда торс остаётся
@@ -1530,6 +1528,7 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
     ML = MR = None
     belly_depth_coef = belly_ext_left_coef = belly_ext_right_coef = 0.0
     belly_ok = False
+    belly_sh_hip_angle = None
     belly_reason = 'выключена флагом CALIBRATION_BELLY_ENABLED'
 
     if torso_rect_below_frame:
@@ -1547,7 +1546,7 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
         # начинается вовсе. Середина же лежит на корпусе при любом ракурсе, а
         # остановка в зазоре у руки -- ровно то, что нужно: линия живота
         # заканчивается на боку, а не уходит в руку.
-        belly_mid = (sh_l + sh_r) / 2.0 + belly_off * n_sh
+        belly_mid = ((sh_l + sh_r) / 2.0 + (hip_l + hip_r) / 2.0) / 2.0
         max_extend_belly = config.CALIBRATION_BELLY_EXTEND_COEF * S
         ML = _find_mask_boundary_along(mask, belly_mid, u_shoulder,
                                        max_extend_belly)
@@ -1577,23 +1576,22 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
             if not belly_ok:
                 belly_reason = 'шестиугольник самопересекается'
 
-        # Луч до границы маски -- уже без ограничения max_extend_belly: сам ML
-        # (MR) мог упереться в потолок 1.5*S, не дойдя до руки, а вопрос в том,
-        # что стоит сбоку от корпуса на уровне живота. Если свободный луч
-        # задевает фигуру руки или ноги, значит конечность прижата к боку без
-        # зазора в маске, линия живота уходит в неё, и корректной ширины талии
-        # тут не измерить -- отдаём прежний четырёхугольник.
+        # Сама линия живота ML-MR не должна касаться фигур рук и ног. Если
+        # касается, конечность прижата к боку без зазора в маске, конец линии
+        # ушёл в неё, и ширины талии тут не измерить -- отдаём прежний
+        # четырёхугольник.
         if belly_ok and limb_rects:
             barrier = np.zeros(mask.shape[:2], dtype=np.uint8)
             for rect in limb_rects:
                 cv2.fillPoly(barrier, [np.asarray(rect, dtype=np.int32)], 255)
-            reach = float(np.hypot(mask.shape[1], mask.shape[0]))
-            for direction in (u_shoulder, -u_shoulder):
-                far = _find_mask_boundary_along(mask, belly_mid, direction, reach)
-                if _segment_hits(barrier, belly_mid, far):
-                    belly_ok = False
-                    belly_reason = 'луч упирается в фигуру руки или ноги'
-                    break
+            if _segment_hits(barrier, ML, MR):
+                belly_ok = False
+                belly_reason = 'линия касается фигуры руки или ноги'
+
+        # Угол между линиями плеч и таза на калибровке -- с ним трекинг
+        # сравнивает текущую позу (CALIBRATION_BELLY_MAX_ANGLE_DIFF_DEG).
+        if belly_ok:
+            belly_sh_hip_angle = shoulder_hip_angle_deg(sh_l, sh_r, hip_l, hip_r)
 
     # --- Параметры для отслеживания (нормализованные на ширину плеч S) ---
     # Верхние точки: фактическое продление плеч (доли от S). Оставлено для
@@ -1728,6 +1726,9 @@ def calibrate_torso(mask, pose_landmarks, region, frame_w, frame_h,
         # Линия живота (концы -- вершины ML, MR шестиугольника)
         'has_belly': belly_ok,
         'belly_reason': belly_reason,
+        'belly_sh_hip_angle': belly_sh_hip_angle,
+        # Линия живота стоит на середине AB (середина плеч -- середина таза).
+        'belly_mid_ab': bool(belly_ok),
         'belly_depth_coef': belly_depth_coef,
         'belly_ext_left_coef': belly_ext_left_coef,
         'belly_ext_right_coef': belly_ext_right_coef,
@@ -1899,6 +1900,10 @@ def save_calibration_params(filepath, head_result, torso_result,
             'belly_depth_coef': float(torso_result.get('belly_depth_coef', 0.0)),
             'belly_ext_left_coef': float(torso_result.get('belly_ext_left_coef', 0.0)),
             'belly_ext_right_coef': float(torso_result.get('belly_ext_right_coef', 0.0)),
+            'belly_sh_hip_angle': (
+                None if torso_result.get('belly_sh_hip_angle') is None
+                else float(torso_result['belly_sh_hip_angle'])),
+            'belly_mid_ab': bool(torso_result.get('belly_mid_ab', False)),
         }
 
     with open(filepath, 'w') as f:

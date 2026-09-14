@@ -370,8 +370,10 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
     limb_rects = None
     if body_rects is not None:
         barrier_rects = body_rects['arms'] + body_rects['palms']
-        # Фигуры конечностей: в них не должна упираться линия живота.
-        limb_rects = body_rects['arms'] + body_rects['legs']
+        # Фигуры конечностей: их не должна касаться линия живота.
+        limb_rects = (body_rects['arms'] + body_rects['palms']
+                      + body_rects['legs']
+                      + list(body_rects.get('thigh_rects', [])))
 
     torso_result = calibrate_torso(mask_full, pose_landmarks, region,
                                    frame_w, frame_h,
@@ -539,6 +541,9 @@ def main(video_path=None, frame_index=None, params_path=None, image_path=None,
             print(f"    belly_depth_coef:     {torso_result['belly_depth_coef']:.4f}")
             print(f"    belly_ext_left_coef:  {torso_result['belly_ext_left_coef']:.4f}")
             print(f"    belly_ext_right_coef: {torso_result['belly_ext_right_coef']:.4f}")
+            if torso_result.get('belly_sh_hip_angle') is not None:
+                print(f"    угол плечи/таз:       "
+                      f"{torso_result['belly_sh_hip_angle']:+.1f} град")
         else:
             print(f"  Линия живота: не построена "
                   f"({torso_result.get('belly_reason', 'причина не указана')})")

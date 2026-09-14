@@ -138,6 +138,23 @@ def n_up_torso(u_shoulder, sh_mid, hip_l=None, hip_r=None):
     return n_up
 
 
+def shoulder_hip_angle_deg(sh_l, sh_r, hip_l, hip_r):
+    """Угол от линии плеч 11-12 к линии таза 23-24, градусы в (-180, 180].
+
+    Обе линии берутся в одном направлении (от точки 11 к 12 и от 23 к 24),
+    поэтому у ровно стоящего человека угол около нуля. None, если какой-то
+    из точек нет или отрезок вырожден.
+    """
+    if sh_l is None or sh_r is None or hip_l is None or hip_r is None:
+        return None
+    a = np.asarray(sh_r, dtype=np.float64) - np.asarray(sh_l, dtype=np.float64)
+    b = np.asarray(hip_r, dtype=np.float64) - np.asarray(hip_l, dtype=np.float64)
+    if float(np.linalg.norm(a)) < 1e-6 or float(np.linalg.norm(b)) < 1e-6:
+        return None
+    return float(np.degrees(np.arctan2(a[0] * b[1] - a[1] * b[0],
+                                       float(np.dot(a, b)))))
+
+
 def build_torso_quad_from_params(params, sh_l, sh_r, hip_l=None, hip_r=None,
                                  frame_h=None):
     """Строит четырёхугольник торса на текущем кадре по параметрам калибровки.
@@ -233,18 +250,39 @@ def build_torso_quad_from_params(params, sh_l, sh_r, hip_l=None, hip_r=None,
             and params.get('has_belly', False)):
         return np.array([TL, TR, BR, BL], dtype=np.float64)
 
-    # Линия живота: параллельна линии плеч, смещена по нормали к торсу, концы
-    # отложены вдоль линии плеч от её середины на запомненные величины.
-    n_sh = _rotate90(u_shoulder)
-    if float(np.dot(BL - TL, n_sh)) < 0:
-        n_sh = -n_sh
-    # Глубина берётся с ТЕКУЩЕГО контура, поэтому линия всегда стоит на
-    # запомненной доле расстояния плечи->торс, как бы ни изменилась поза.
-    depth_cur = (float(np.dot(BL - TL, n_sh)) + float(np.dot(BR - TR, n_sh))) / 2.0
-    belly_off = params['belly_depth_coef'] * depth_cur
-    # Концы откладываются от СЕРЕДИНЫ линии живота -- так же, как замерялись
-    # при калибровке (см. calibrate_torso).
-    belly_mid = sh_mid + belly_off * n_sh
+    # Корпус повернулся относительно таза сильнее допуска -- ширина талии с
+    # калибровки к этой позе не относится. Проверить можно только при
+    # видимом тазе; без него линия не строится. Старые калибровки без
+    # запомненного угла -- как раньше, без проверки.
+    calib_angle = params.get('belly_sh_hip_angle')
+    if calib_angle is not None:
+        cur_angle = shoulder_hip_angle_deg(sh_l, sh_r, hip_l, hip_r)
+        if cur_angle is None:
+            return np.array([TL, TR, BR, BL], dtype=np.float64)
+        diff = (cur_angle - float(calib_angle) + 180.0) % 360.0 - 180.0
+        if abs(diff) > config.CALIBRATION_BELLY_MAX_ANGLE_DIFF_DEG:
+            return np.array([TL, TR, BR, BL], dtype=np.float64)
+
+    # Линия живота: параллельна линии плеч, концы отложены вдоль неё от
+    # середины линии на запомненные доли текущей ширины плеч.
+    if params.get('belly_mid_ab', False):
+        # Середина линии -- середина отрезка AB: A -- середина плеч 11-12,
+        # B -- середина таза 23-24. Ровно так её ставила калибровка. Без
+        # таза точки B нет -- линия не строится.
+        if hip_l is None or hip_r is None:
+            return np.array([TL, TR, BR, BL], dtype=np.float64)
+        hip_mid_cur = (np.asarray(hip_l, dtype=np.float64)
+                       + np.asarray(hip_r, dtype=np.float64)) / 2.0
+        belly_mid = (sh_mid + hip_mid_cur) / 2.0
+    else:
+        # Старые калибровки: доля глубины плечи -> низ торса по нормали к
+        # линии плеч, отложенная от середины плеч.
+        n_sh = _rotate90(u_shoulder)
+        if float(np.dot(BL - TL, n_sh)) < 0:
+            n_sh = -n_sh
+        depth_cur = (float(np.dot(BL - TL, n_sh))
+                     + float(np.dot(BR - TR, n_sh))) / 2.0
+        belly_mid = sh_mid + params['belly_depth_coef'] * depth_cur * n_sh
     ML = belly_mid + params['belly_ext_left_coef'] * S_cur * u_shoulder
     MR = belly_mid - params['belly_ext_right_coef'] * S_cur * u_shoulder
 

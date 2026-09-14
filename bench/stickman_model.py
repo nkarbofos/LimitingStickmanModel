@@ -739,8 +739,24 @@ def _pair_limb_quad(pair, points, S, S_hip, limb_widths=None,
 THIGH_WIDTH_SOURCE = {(23, 25): (25, 27), (24, 26): (26, 28)}
 
 
+def thigh_limb_in_frame(landmarks, region, frame_w, frame_h, pair):
+    """Нога (пара таз-колено) целиком присутствует в кадре.
+
+    Обе точки должны быть и видны (проходить порог видимости), и лежать в
+    кадре. Одной видимости мало: поза дорисовывает точки за кадром -- на
+    half010 кадр 30 колени "видны" с 0.74-0.76, но стоят на y=1462 при высоте
+    кадра 1280. Зеркальное колено (knee_point) сюда не считается: оно
+    строится как раз потому, что настоящего не видно.
+    """
+    for idx in pair:
+        p = _get_point_px(landmarks, idx, region, frame_w, frame_h)
+        if p is None or not _point_in_frame(p, frame_w, frame_h):
+            return False
+    return True
+
+
 def build_thigh_rects(landmarks, region, frame_w, frame_h, S, S_hip,
-                      limb_widths=None, limb_grow=None, torso_quad=None):
+                      limb_widths=None, limb_grow=None):
     """Прямоугольники бёдер 23-25 и 24-26 -- постоянной ширины.
 
     Ширина берётся замеренная в колене: ровно та, с которой из колена выходит
@@ -751,14 +767,18 @@ def build_thigh_rects(landmarks, region, frame_w, frame_h, S, S_hip,
     Отдельно от build_thigh_quads: тот строит верх ноги от вершин торса и
     закрывает пах, а здесь -- прямая кость от таза к колену.
 
+    Прямоугольник строится только для ноги, которая целиком присутствует в
+    кадре (thigh_limb_in_frame). Если в кадре нет ни одной, вместо них
+    строится фолбэк от нижнего ребра торса -- build_legs_below_frame_quad.
+
     Возвращает список контуров (может быть пустым).
     """
     out = []
     for pair, shin in THIGH_WIDTH_SOURCE.items():
-        A = _get_point_px(landmarks, pair[0], region, frame_w, frame_h)
-        B = knee_point(landmarks, region, frame_w, frame_h, pair[1], torso_quad)
-        if A is None or B is None:
+        if not thigh_limb_in_frame(landmarks, region, frame_w, frame_h, pair):
             continue
+        A = _get_point_px(landmarks, pair[0], region, frame_w, frame_h)
+        B = _get_point_px(landmarks, pair[1], region, frame_w, frame_h)
         widths = limb_widths_px(shin, S, S_hip, limb_widths, limb_grow)
         if widths is None:
             continue
@@ -828,8 +848,9 @@ def build_legs_below_frame_quad(landmarks, region, frame_w, frame_h,
                                 torso_quad=None):
     """Прямоугольник вниз за кадр -- когда ног не видно.
 
-    Строится, только если ни одно колено не попало в кадр, а обе точки таза
-    (23 и 24) видны. Верхнее ребро -- нижнее ребро откалиброванного торса
+    Строится, только если ни одна нога (23-25 или 24-26) не присутствует в
+    кадре полностью (thigh_limb_in_frame). Верхнее ребро -- нижнее ребро
+    откалиброванного торса
     (BL-BR), оно подогнано по маске и шире отрезка самих точек таза; без
     торса берётся отрезок 23-24. Нижнее ребро опущено по нормали до полного
     выхода за низ кадра, как у торса без бёдер.
@@ -840,21 +861,11 @@ def build_legs_below_frame_quad(landmarks, region, frame_w, frame_h,
         return None
     P = lambda i: _get_point_px(landmarks, i, region, frame_w, frame_h)
 
-    def knee_in_frame(idx):
-        """Колено и видно, и лежит в кадре.
-
-        Одной видимости мало: поза дорисовывает точки за кадром (на half010
-        кадр 30 колени "видны" с 0.74-0.76, но стоят на y=1462 при высоте
-        кадра 1280). Для нас нога не видна, пока её нет в кадре.
-        """
-        p = P(idx)
-        return p is not None and _point_in_frame(p, frame_w, frame_h)
-
-    if knee_in_frame(LEFT_KNEE) or knee_in_frame(RIGHT_KNEE):
-        return None                      # колено в кадре -- ноги строятся как обычно
-    hip_l, hip_r = P(LEFT_HIP), P(RIGHT_HIP)
-    if hip_l is None or hip_r is None:
+    # Хотя бы одна нога целиком в кадре -- её прямоугольник строится сам.
+    if any(thigh_limb_in_frame(landmarks, region, frame_w, frame_h, pair)
+           for pair in THIGH_PAIRS):
         return None
+    hip_l, hip_r = P(LEFT_HIP), P(RIGHT_HIP)
     # Верхнее ребро: нижняя сторона торса, если она есть.
     top_a, top_b, n_down = hip_r, hip_l, None
     if torso_quad is not None:
@@ -866,6 +877,9 @@ def build_legs_below_frame_quad(landmarks, region, frame_w, frame_h,
                 np.asarray(br, dtype=np.float64), axis[1]
 
     if n_down is None:
+        # Торса нет -- ребро идёт по самим точкам таза, без них строить нечего.
+        if hip_l is None or hip_r is None:
+            return None
         d = top_b - top_a
         n = float(np.linalg.norm(d))
         if n < 1e-6:
@@ -891,9 +905,12 @@ def choose_thigh_quad_mode(mask, landmarks, region, frame_w, frame_h,
     Областью сравнения служит шестиугольник режима 2. Внутри него у каждого
     варианта считается IoU его фигур с ground truth маской, берётся лучший.
 
-    Проверка на руки идёт по другой фигуре -- четырёхугольнику 23-24-26-25
-    (таз и колени). Он описывает саму зону ног по точкам позы, без ширин и
-    калибровки, и не зависит от того, какой вариант сейчас строится.
+    Обе проверки на отказ идут по другой фигуре -- четырёхугольнику
+    23-24-26-25 (таз и колени). Он описывает саму зону ног по точкам позы,
+    без ширин и калибровки, и не зависит от того, какой вариант строится:
+      * в зону попали фигуры рук -- маска там не про ноги;
+      * маска заливает зону больше чем на STICKMAN_THIGH_QUAD_AUTO_MAX_FILL --
+        просвета между ног нет, варианты покроют одно и то же.
 
     Возвращает (режим, причина). Причина -- строка для печати.
     """
@@ -931,26 +948,15 @@ def choose_thigh_quad_mode(mask, landmarks, region, frame_w, frame_h,
         if hands and int(cv2.countNonZero(cv2.bitwise_and(fill(hands), zone))):
             return 0, 'в зону 23-24-26-25 попали фигуры рук'
 
-    # Фигуры бёдер касаются друг друга: просвета между ног нет.
-    def dist(i, j):
-        a = _get_point_px(landmarks, i, region, frame_w, frame_h)
-        b = _get_point_px(landmarks, j, region, frame_w, frame_h)
-        if a is None or b is None:
-            return None
-        d = float(np.linalg.norm(b - a))
-        return d if d > 1e-6 else None
-
-    S = dist(LEFT_SHOULDER, RIGHT_SHOULDER)
-    if S is None:
-        return 0, 'плечи не видны'
-    S_hip = dist(LEFT_HIP, RIGHT_HIP) or S
-    rects = build_thigh_rects(landmarks, region, frame_w, frame_h,
-                              S, S_hip, limb_widths, limb_grow,
-                              torso_quad=torso_quad)
-    if len(rects) == 2:
-        if int(cv2.countNonZero(cv2.bitwise_and(fill([rects[0]]),
-                                                fill([rects[1]])))):
-            return 0, 'фигуры бёдер касаются'
+    # Зона ног залита маской почти целиком: просвета между ног нет.
+    zone_area = int(cv2.countNonZero(zone))
+    if zone_area == 0:
+        return 0, 'зона 23-24-26-25 вырождена'
+    zone_fill = int(cv2.countNonZero(cv2.bitwise_and(mask, zone))) / zone_area
+    max_fill = float(getattr(config, 'STICKMAN_THIGH_QUAD_AUTO_MAX_FILL', 0.98))
+    if zone_fill > max_fill:
+        return 0, 'маска занимает зону 23-24-26-25 на %.1f%% (> %.0f%%)' % (
+            100.0 * zone_fill, 100.0 * max_fill)
 
     gt = cv2.bitwise_and(mask, area)
     best, best_iou = 0, -1.0
@@ -965,7 +971,8 @@ def choose_thigh_quad_mode(mask, landmarks, region, frame_w, frame_h,
         scores.append(iou)
         if iou > best_iou:
             best, best_iou = m, iou
-    return best, 'IoU 0:%.3f 1:%.3f 2:%.3f' % tuple(scores)
+    return best, 'IoU 0:%.3f 1:%.3f 2:%.3f, маска в зоне %.1f%%' % (
+        tuple(scores) + (100.0 * zone_fill,))
 
 
 def build_joint_wedges(landmarks, region, frame_w, frame_h, limb_widths=None,
@@ -1607,8 +1614,7 @@ def build_stickman_mask(pose_landmarks_list, region, frame_w, frame_h,
 
     # 4a. Прямоугольники бёдер: постоянная ширина, равная замеренной в колене.
     for rect in build_thigh_rects(landmarks, region, frame_w, frame_h,
-                                  S, S_hip, limb_widths, limb_grow,
-                                  torso_quad=torso_quad):
+                                  S, S_hip, limb_widths, limb_grow):
         cv2.fillPoly(mask, [rect], 255)
 
     # 4b. Треугольники плеча: клин между скатом плеча (луч под углом) и

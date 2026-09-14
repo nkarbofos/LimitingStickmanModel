@@ -430,6 +430,17 @@ def main(video_path=None, output_path=None, calibration_params_path=None,
                                   isClosed=True, color=color,
                                   thickness=config.TRACKED_THICKNESS)
 
+                # Отладка живота: отрезок ML-MR, если торс на этом кадре --
+                # шестиугольник [TL, TR, MR, BR, BL, ML].
+                if config.DRAW_TRACKED_BELLY and torso_quad is not None \
+                        and len(torso_quad) == 6:
+                    _tq = np.asarray(torso_quad, dtype=np.float64)
+                    cv2.line(overlay,
+                             tuple(int(round(v)) for v in _tq[5]),
+                             tuple(int(round(v)) for v in _tq[2]),
+                             config.CALIB_BELLY_COLOR,
+                             config.TRACKED_THICKNESS + 1, cv2.LINE_AA)
+
                 # Отладка шеи: её вершины и опорные точки поверх всего.
                 if config.DRAW_NECK_POINTS:
                     _dlm = pose_result.pose_landmarks[0]
